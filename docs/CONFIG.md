@@ -197,22 +197,20 @@ every judge fails, the check is recorded as **not judged** with the HTTP
 status. That shows in `smem review`, `smem doctor` and `smem judges`, so it
 never looks the same as having no judge.
 
-**Through a gateway** with no Anthropic
-API key:
+**Through an API gateway or proxy**, with no Anthropic API key of your own:
 
 ```sh
 export ANTHROPIC_BASE_URL=https://gateway.example.com
 export ANTHROPIC_AUTH_TOKEN=…                         # or a key in the headers below
-export ANTHROPIC_CUSTOM_HEADERS='x-gateway-key: …'   # "Name: value" lines, as in Claude Code
-export SMEM_JUDGE_MODEL=my-gateway/claude-haiku-5-5
+export ANTHROPIC_CUSTOM_HEADERS='x-gateway-key: …'  # "Name: value" lines, as in Claude Code
+export SMEM_JUDGE_MODEL=my-gateway/claude-haiku-5-5  # if the gateway prefixes model ids
 ```
 
 `SMEM_JUDGE_MODEL` overrides `judges.claude.model` for one agent. smem never
 reads Claude Code's own model variables (`ANTHROPIC_DEFAULT_*_MODEL`).
 Header values are treated as secrets: they are redacted, and checkers never
-see them. smem identifies itself as itself. A gateway that only serves
-requests presenting as Claude Code is fronting Claude Code seats, and smem
-won't work through it. Use a route backed by an API key.
+see them. smem always identifies itself as smem; it never presents itself
+as another client.
 
 - **Jev** is enabled by `TYPESAFE_API_KEY`, or `OPENROUTER_API_KEY` to reach
   it through OpenRouter.

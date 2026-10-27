@@ -534,7 +534,7 @@ func TestClaudeThroughGatewayHeaders(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "gateway-token")
 	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
-	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "x-gateway-key: gw-agent-key-123456\nx-team: dojo")
+	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "x-gateway-key: gw-agent-key-123456\nx-team: acme")
 	t.Setenv("SMEM_JUDGE_MODEL", "my-gateway/claude-haiku-5-5")
 	t.Setenv("TYPESAFE_API_KEY", "")
 	t.Setenv("OPENROUTER_API_KEY", "")
@@ -551,7 +551,7 @@ func TestClaudeThroughGatewayHeaders(t *testing.T) {
 	remember(t, e, "fact", "the release moved to the 21st")
 	res := must[*FactCheckResult](t)(e.FactCheck(context.Background(), m, true))
 
-	if got.Get("x-gateway-key") != "gw-agent-key-123456" || got.Get("x-team") != "dojo" || got.Get("Authorization") != "Bearer gateway-token" {
+	if got.Get("x-gateway-key") != "gw-agent-key-123456" || got.Get("x-team") != "acme" || got.Get("Authorization") != "Bearer gateway-token" {
 		t.Fatalf("headers: %v", got)
 	}
 	if body["model"] != "my-gateway/claude-haiku-5-5" {
