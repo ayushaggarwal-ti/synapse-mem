@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -32,7 +34,8 @@ var commitLine = regexp.MustCompile(`\[[^\]\s]+(?: \([^)]*\))? ([0-9a-f]{7,40})\
 // linked to the session's latest active decision, which is a heuristic; an
 // explicit `smem action --decision` is more precise.
 func (e *Engine) RecordToolUse(in HookInput, includeReadOnly bool) (string, error) {
-	if in.ToolName == "" || (!includeReadOnly && readOnlyTools[in.ToolName]) {
+	// smem's own MCP tools record themselves; logging them again is noise.
+	if in.ToolName == "" || strings.Contains(in.ToolName, "smem__") || (!includeReadOnly && readOnlyTools[in.ToolName]) {
 		return "", nil
 	}
 	if in.SessionID != "" {
@@ -89,4 +92,25 @@ func hashRaw(b json.RawMessage) string {
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// sessionFile holds the id of the latest Claude Code session to start here.
+// The session-start hook writes it so a long-running MCP server, which is
+// not told the session id, can file its records under the same session as
+// the hook's actions. With two sessions in one directory the newest wins.
+func sessionFile(db string) string { return filepath.Join(filepath.Dir(db), "session") }
+
+// SetCurrentSession records id as the current session for this store.
+func (e *Engine) SetCurrentSession(id string) error {
+	e.Session = id
+	return os.WriteFile(sessionFile(e.path), []byte(id+"\n"), 0o600)
+}
+
+// CurrentSession returns the session recorded by SetCurrentSession, or "".
+func (e *Engine) CurrentSession() string {
+	b, err := os.ReadFile(sessionFile(e.path))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }

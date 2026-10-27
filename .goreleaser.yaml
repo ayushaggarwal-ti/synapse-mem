@@ -1,0 +1,17 @@
+version: 2
+project_name: smem
+builds:
+  - main: ./cmd/smem
+    binary: smem
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{.Version}}"]
+    goos: [darwin, linux]
+    goarch: [arm64, amd64]
+archives:
+  - name_template: "smem_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [README.md, docs/DESIGN.md]
+checksum:
+  name_template: checksums.txt
+changelog:
+  use: git

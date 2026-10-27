@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"synapse-mem/judge"
+	"github.com/rahulsub/synapse-mem/judge"
 )
 
 // scripted is a judge that returns a fixed relation.

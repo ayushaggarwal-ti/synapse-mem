@@ -249,9 +249,51 @@ was done (hook-captured actions). When they disagree, that is worth seeing.
 * Every event is hashed (covering its replica, position, previous hash, time,
   actor, key, type, subject and payload) and signed.
 * SQLite triggers refuse `UPDATE` and `DELETE` on `events`.
-* **Redaction happens before hashing.** Common secret shapes (API keys,
-  tokens, private keys, JWTs, `*_TOKEN=` assignments) are replaced in every
-  payload. An append-only log can't be cleaned up later.
+* **Redaction happens before hashing.** An append-only log can't be cleaned
+  up later, so secrets have to be stopped on the way in (see below).
+
+### Credentials
+
+The judge keys (`TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`,
+`ANTHROPIC_API_KEY`) are read from the environment when the store is
+configured and held only in memory. They are never written to the database,
+`.smem/config.json` or any output, and errors from judges never include
+response bodies.
+
+Everything else that could carry a secret goes through `Redact`:
+
+| Path | What is redacted |
+|---|---|
+| Every event payload | each string value, after decoding, before hashing and signing |
+| Fact-check evidence | file and commit text, before it is sent to a judge |
+| Checker errors | the checker's stderr |
+
+`Redact` removes two kinds of thing:
+
+1. **The exact values of credential environment variables**, in any format:
+   the judge keys plus any variable whose name looks like a secret
+   (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*API_KEY*`, `*CREDENTIAL*`,
+   `*AUTH*`) with a value of 12 or more characters. A key in a format no
+   pattern knows is still caught if it is in the agent's environment.
+2. **Common secret shapes**: Anthropic/OpenAI-style keys, AWS, GitHub and
+   Slack tokens, JWTs, PEM private keys, `Bearer`/`Basic` credentials,
+   `Authorization:`/`x-api-key:` headers, `user:password@` in URLs,
+   `NAME=value` / `"name": "value"` for secret-like names, and
+   `--password value`-style flags.
+
+Command checkers run with the judge keys removed from their environment. A
+checker is local code you configured, but it has no need for smem's model
+credentials.
+
+Tool calls captured by the hook are stored as a redacted one-line summary and
+hashes of the arguments and result, never the full arguments or output.
+
+**Limits.** Pattern matching is best effort: a secret in an unknown format
+that is not in the environment (say, pasted into a memory by hand) can get
+through. If one does, it is in the signed log for good: rotate the secret.
+`TestCredentialsNeverStored` plants keys in the environment, drives every
+write path and a hostile checker, and scans the database files, the export
+and what the judge received.
 
 `smem verify` checks for every replica: contiguous `rseq`, each `prev` equal
 to the previous hash, each hash equal to its recomputed content, each
@@ -426,19 +468,19 @@ Known costs as the store grows:
    detection via the judge layer and `smem rules rationalize`.
 2. **Semantic recall.** Add embeddings (sqlite-vec) as another relevance
    signal next to bm25; `auth` should find "authentication".
-2. **Extraction and consolidation.** A pass at session end proposes memories
+3. **Extraction and consolidation.** A pass at session end proposes memories
    and decisions from the transcript, as proposals the agent or user confirms.
    Repeated episodes become facts or procedures, linked by `derived_from`.
-3. **Assumption checking** through the same checker/judge cascade:
+4. **Assumption checking** through the same checker/judge cascade:
    assumptions are claims too.
-4. **Key rotation and revocation** as signed events; a trusted-keys file that
+5. **Key rotation and revocation** as signed events; a trusted-keys file that
    can be committed to a repo.
-5. **Evaluation.** Replay past sessions with `--known-at` and measure whether
+6. **Evaluation.** Replay past sessions with `--known-at` and measure whether
    recall surfaced what was later cited.
-6. **Beads integration.** Write `bd provenance` entries for decisions that
+7. **Beads integration.** Write `bd provenance` entries for decisions that
    name a bead, and file suspect decisions as beads so they show up in
    `bd ready`.
-7. **Feed offsets.** Pull currently re-reads whole feed files; track offsets
+8. **Feed offsets.** Pull currently re-reads whole feed files; track offsets
    per feed for large logs.
 
 ## 12. Code map
@@ -456,8 +498,34 @@ Known costs as the store grows:
 | `smem/why.go` | Traces and their text rendering |
 | `smem/verify.go` | Verification, heads, rebuild |
 | `smem/sync.go` | Import, export, directory remote |
-| `smem/hook.go` | Claude Code hook capture |
+| `smem/hook.go` | Claude Code hook capture, current session |
+| `smem/redact.go` | Secret redaction, checker environment |
 | `smem/factcheck.go` | Checkers, evidence gathering, fact-check cascade, judgments |
 | `smem/config.go` | `.smem/config.json` and judge setup from the environment |
 | `judge/` | Typed questions, cascade, Jev and Claude judges |
+| `mcp/` | MCP server (JSON-RPC over stdio) and its tools |
 | `cmd/smem` | CLI |
+| `plugin/` | Claude Code plugin: MCP server, hooks, skill |
+
+## 13. Packaging
+
+One codebase ships four ways:
+
+| Form | For | How |
+|---|---|---|
+| Go library | Go agents | `go get github.com/rahulsub/synapse-mem/smem`; `smem.Open`, then `Configure` |
+| `smem` binary | shells, scripts, VMs | static, no cgo: darwin/linux × arm64/amd64 from goreleaser on a `v*` tag |
+| `smem mcp` | any MCP-capable agent | stdio server with eleven tools; one config entry |
+| Claude Code plugin | Claude Code | `plugin/`: the MCP server, both hooks and a usage skill |
+
+The MCP server handles one request at a time (the store has one writer). It
+signs as the connecting client (`clientInfo.name`, e.g. `claude-code`) unless
+`SMEM_ACTOR` is set, so the hook's records and the server's share a key. It
+files records under the session the session-start hook last wrote to
+`.smem/session`, so a decision made over MCP links to the tool calls the hook
+records afterwards. With two sessions in one directory, the newest wins.
+
+`smem mcp --init` creates `.smem/` in the working directory if no store is
+found above it. `Open` writes `.smem/.gitignore` so the store, WAL and session
+file stay out of git while `config.json` can be committed.
+

@@ -7,13 +7,11 @@
 package smem
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -23,7 +21,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"synapse-mem/judge"
+	"github.com/rahulsub/synapse-mem/judge"
 )
 
 // Engine is a handle on one smem database (one replica).
@@ -58,8 +56,17 @@ type execer interface {
 
 // Open opens or creates the database at path.
 func Open(path string) (*Engine, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
+	}
+	// In a project's .smem directory, keep the store out of git; the config
+	// (checkers, judge settings) can still be committed.
+	if filepath.Base(dir) == ".smem" {
+		ignore := filepath.Join(dir, ".gitignore")
+		if _, err := os.Stat(ignore); errors.Is(err, os.ErrNotExist) {
+			os.WriteFile(ignore, []byte("*\n!.gitignore\n!config.json\n"), 0o644)
+		}
 	}
 	dsn := "file:" + path + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
@@ -188,18 +195,14 @@ func (w *wtx) emit(typ, subject string, payload any) (Event, error) {
 }
 
 func (w *wtx) emitWith(priv ed25519.PrivateKey, kid, typ, subject string, payload any) (Event, error) {
-	raw, err := json.Marshal(payload)
+	// Redact before hashing: the log is append-only, so a secret that gets
+	// in can never be removed.
+	raw, err := redactPayload(payload)
 	if err != nil {
 		return Event{}, err
 	}
-	// Redact before hashing: the log is append-only, so a secret that gets
-	// in can never be removed.
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, []byte(Redact(string(raw)))); err != nil {
-		return Event{}, fmt.Errorf("payload after redaction: %w", err)
-	}
 	ev := Event{Replica: w.e.replica, Actor: w.e.Actor, KeyID: kid, Session: w.e.Session,
-		Type: typ, Subject: subject, Payload: buf.Bytes()}
+		Type: typ, Subject: subject, Payload: raw}
 	err = w.tx.QueryRow(`SELECT rseq, hash FROM events WHERE replica = ? ORDER BY rseq DESC LIMIT 1`, w.e.replica).Scan(&ev.RSeq, &ev.Prev)
 	if errors.Is(err, sql.ErrNoRows) {
 		ev.Prev = genesisHash

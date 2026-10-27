@@ -7,12 +7,58 @@ append-only event log that works locally or syncs between machines.
 
 Design: [docs/DESIGN.md](docs/DESIGN.md)
 
-## Build
+## Install
+
+The repo is private, so Go must skip the public proxy and fetch with a key
+that has access (here the `github.com-rahulsub` SSH alias):
 
 ```sh
-go build -o bin/smem ./cmd/smem
-go test ./...
+export GOPRIVATE=github.com/rahulsub/*
+git config --global url."git@github.com-rahulsub:rahulsub/".insteadOf "https://github.com/rahulsub/"
+go install github.com/rahulsub/synapse-mem/cmd/smem@latest
 ```
+
+Or download a binary from the GitHub release (darwin/linux, arm64/amd64),
+or build from a checkout with `make build` (`make dist` for every platform).
+
+### Claude Code
+
+```
+/plugin marketplace add git@github.com-rahulsub:rahulsub/synapse-mem.git
+/plugin install smem@synapse-mem
+```
+
+(`rahulsub/synapse-mem` works too where the default GitHub credentials can
+read the repo.)
+
+The plugin adds the `smem` MCP server (memory and decision tools), the
+session-start and post-tool-use hooks, and a skill on when to use them. It
+needs the `smem` binary on `PATH` (or `SMEM_BIN`). It creates `.smem/` in each
+project on first use, already git-ignored except `config.json`.
+
+### Any MCP agent
+
+```json
+{"mcpServers": {"smem": {"command": "smem", "args": ["mcp", "--init"]}}}
+```
+
+Tools: `memory_recall`, `memory_context`, `memory_remember`, `memory_update`,
+`memory_invalidate`, `memory_signal`, `decision_record`, `decision_outcome`,
+`why`, `review`, `factcheck`.
+
+### Go
+
+```go
+e, err := smem.Open(".smem/smem.db")
+cfg, _ := smem.LoadConfig(smem.ConfigPath(e.Path()))
+e.Configure(cfg) // judges from TYPESAFE_API_KEY / ANTHROPIC_API_KEY
+id, err := e.Remember(smem.MemoryInput{Kind: "fact", Content: "..."})
+```
+
+### Release
+
+`git tag v0.2.0 && git push origin v0.2.0` runs the tests and publishes
+binaries with checksums via goreleaser.
 
 ## Quick tour
 
@@ -91,12 +137,21 @@ records that it did. The post-tool-use hook records each mutating tool call,
 including commit shas, linked to the session's current decision. Hooks never
 fail the agent.
 
+## Credentials
+
+API keys are read from the environment only and never stored. Every payload
+is redacted before it is signed, as is evidence before it goes to a judge.
+Redaction removes the exact values of credential-like environment variables,
+whatever their format, and common secret shapes in text. Command checkers
+don't get the judge keys. Details and limits: DESIGN.md §7.
+
 ## Environment
 
 | Variable | Meaning |
 |---|---|
 | `SMEM_DB` | Database path (default: nearest `.smem/smem.db`) |
-| `SMEM_ACTOR` | Who is writing (default `$USER`; hooks default to `claude-code`) |
+| `SMEM_ACTOR` | Who is writing (default `$USER`; hooks default to `claude-code`, MCP to the client's name) |
+| `SMEM_BIN` | Binary the Claude Code plugin runs (default: `smem` on `PATH`) |
 | `SMEM_SESSION` | Session id |
 | `SMEM_KEY_DIR` | Private keys (default: user config dir `smem/keys`) |
 | `TYPESAFE_API_KEY` / `OPENROUTER_API_KEY` | Enables the Jev judge |

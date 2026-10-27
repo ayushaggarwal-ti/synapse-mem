@@ -1,4 +1,4 @@
-module synapse-mem
+module github.com/rahulsub/synapse-mem
 
 go 1.27.3
 

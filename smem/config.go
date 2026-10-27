@@ -11,7 +11,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/v2"
 	"github.com/anthropics/anthropic-sdk-go/v2/option"
 
-	"synapse-mem/judge"
+	"github.com/rahulsub/synapse-mem/judge"
 )
 
 // Config is the local, per-database configuration in .smem/config.json.

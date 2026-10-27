@@ -1,0 +1,17 @@
+{
+  "description": "smem: inject salient memories at session start; record tool calls in the signed log",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/smem hook session-start", "timeout": 10 }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/smem hook post-tool-use", "timeout": 10 }]
+      }
+    ]
+  }
+}

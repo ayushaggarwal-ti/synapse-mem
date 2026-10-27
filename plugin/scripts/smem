@@ -1,0 +1,12 @@
+#!/bin/sh
+# Finds the smem binary. Install it with `go install
+# github.com/rahulsub/synapse-mem/cmd/smem@latest`, from a release, or set
+# SMEM_BIN. Hooks never fail the session when smem is missing.
+for c in "$SMEM_BIN" "$(command -v smem 2>/dev/null)" "$HOME/go/bin/smem" /opt/homebrew/bin/smem /usr/local/bin/smem; do
+  if [ -n "$c" ] && [ -x "$c" ]; then
+    exec "$c" "$@"
+  fi
+done
+echo "smem plugin: the smem binary was not found; install it or set SMEM_BIN" >&2
+[ "$1" = "hook" ] && exit 0
+exit 1

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "smem": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/smem",
+      "args": ["mcp", "--init"]
+    }
+  }
+}

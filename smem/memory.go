@@ -41,6 +41,7 @@ type MemoryInput struct {
 	Confidence float64   // 0..1, default 0.8
 	ValidFrom  time.Time // when it became true in the world; zero = now
 	// DerivedFrom lists the memories, decisions and sources this came from.
+	// Free references (file paths, URLs, commits) are captured as sources.
 	DerivedFrom []string
 }
 
@@ -155,15 +156,24 @@ func (e *Engine) assert(in MemoryInput, supersedes string) (string, []Flag, erro
 		return "", nil, err
 	}
 	p := memoryAsserted{ID: newID("mem"), Kind: in.Kind, Content: in.Content, Scope: in.Scope,
-		Volatility: in.Volatility, Confidence: in.Confidence, DerivedFrom: in.DerivedFrom, Supersedes: supersedes}
+		Volatility: in.Volatility, Confidence: in.Confidence, Supersedes: supersedes}
 	if !in.ValidFrom.IsZero() {
 		p.ValidFrom = ms(in.ValidFrom)
 	}
 	evs, err := e.write(func(w *wtx) error {
-		for _, ref := range p.DerivedFrom {
-			if _, _, err := w.lookup(ref); err != nil {
+		for _, ref := range dedupe(in.DerivedFrom) {
+			if isRecordID(ref) {
+				if _, _, err := w.lookup(ref); err != nil {
+					return err
+				}
+				p.DerivedFrom = append(p.DerivedFrom, ref)
+				continue
+			}
+			src := sourceCaptured{ID: newID("src"), Kind: guessSourceKind(ref), Ref: ref}
+			if _, err := w.emit(evSourceCaptured, src.ID, src); err != nil {
 				return err
 			}
+			p.DerivedFrom = append(p.DerivedFrom, src.ID)
 		}
 		if supersedes != "" {
 			if err := w.require(supersedes, "mem", "active", "suspect"); err != nil {

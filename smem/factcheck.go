@@ -16,7 +16,7 @@ import (
 	"sort"
 	"time"
 
-	"synapse-mem/judge"
+	"github.com/rahulsub/synapse-mem/judge"
 )
 
 // Verdict labels.
@@ -120,11 +120,12 @@ func (c *CommandChecker) Check(ctx context.Context, claim Claim) (CheckResult, e
 	}
 	cmd := exec.CommandContext(ctx, c.Command[0], c.Command[1:]...)
 	cmd.Dir = c.Dir
+	cmd.Env = checkerEnv()
 	cmd.Stdin = bytes.NewReader(in)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return CheckResult{}, fmt.Errorf("%v: %s", err, oneLine(stderr.String(), 200))
+		return CheckResult{}, fmt.Errorf("%v: %s", err, oneLine(Redact(stderr.String()), 200))
 	}
 	var res CheckResult
 	if out := bytes.TrimSpace(stdout.Bytes()); len(out) > 0 {

@@ -1,0 +1,16 @@
+{
+  "name": "synapse-mem",
+  "owner": { "name": "rahulsub" },
+  "metadata": { "description": "smem: agent memory with decay, decision provenance and a signed audit log." },
+  "plugins": [
+    {
+      "name": "smem",
+      "source": "./plugin",
+      "description": "Long-term memory and a decision log for Claude Code: recall and remember over MCP, session-start context, and every tool call recorded in a signed, verifiable log.",
+      "version": "0.2.0",
+      "author": { "name": "rahulsub" },
+      "keywords": ["memory", "provenance", "audit", "decisions", "fact-checking"],
+      "category": "productivity"
+    }
+  ]
+}

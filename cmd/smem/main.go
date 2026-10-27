@@ -11,13 +11,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"synapse-mem/smem"
+	"github.com/rahulsub/synapse-mem/mcp"
+	"github.com/rahulsub/synapse-mem/smem"
 )
 
 const usage = `smem: agent memory with decay, decision provenance and a signed audit log
@@ -73,9 +75,14 @@ Fact-checking
 
 Setup
   init                     create .smem/smem.db here
+  mcp                      serve this store to an agent over MCP (stdio)   --init --session
+  version                  print the version
   hook post-tool-use       record a Claude Code tool call (reads hook JSON on stdin)  --all
   hook session-start       print context for a Claude Code SessionStart hook  --budget
 `
+
+// version is set at build time with -ldflags "-X main.version=...".
+var version = "dev"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout); err != nil {
@@ -107,14 +114,18 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		return nil
 	}
 	cmd, rest := global.Arg(0), global.Args()[1:]
-	if cmd == "help" {
+	switch cmd {
+	case "help":
 		fmt.Fprint(stdout, usage)
+		return nil
+	case "version":
+		fmt.Fprintf(stdout, "smem %s\n", version)
 		return nil
 	}
 
 	path := findDB(*dbPath)
 	switch {
-	case cmd == "init":
+	case cmd == "init", cmd == "mcp" && path == "" && slices.Contains(rest, "--init"):
 		if path == "" || *dbPath == "" {
 			path = filepath.Join(".smem", "smem.db")
 		}
@@ -191,7 +202,7 @@ var commands = map[string]func(*cli, []string) error{
 	"heads": (*cli).heads, "rebuild": (*cli).rebuild, "keys": (*cli).keys, "remote": (*cli).remote,
 	"sync": (*cli).sync, "push": (*cli).push, "pull": (*cli).pull, "export": (*cli).export,
 	"import": (*cli).importCmd, "hook": (*cli).hook,
-	"factcheck": (*cli).factcheck, "judges": (*cli).judges,
+	"factcheck": (*cli).factcheck, "judges": (*cli).judges, "mcp": (*cli).mcp,
 }
 
 // parse parses flags that may appear before, between or after positional args.
@@ -1038,7 +1049,9 @@ func (c *cli) hook(args []string) error {
 		return err
 	case "session-start":
 		if in.SessionID != "" {
-			c.e.Session = in.SessionID
+			if err := c.e.SetCurrentSession(in.SessionID); err != nil {
+				return err
+			}
 		}
 		s, err := c.e.Context(*budget)
 		if err != nil {
@@ -1137,4 +1150,16 @@ func oneLine(s string, n int) string {
 		s = string(r[:n-1]) + "…"
 	}
 	return s
+}
+
+func (c *cli) mcp(args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	fs.Bool("init", false, "create .smem/smem.db here if no store is found")
+	session := fs.String("session", "", "file everything under this session (default: the session the hook recorded)")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	fromClient := os.Getenv("SMEM_ACTOR") == "" && c.e.Actor == os.Getenv("USER")
+	s := &mcp.Server{Engine: c.e, Version: version, Session: *session, ActorFromClient: fromClient}
+	return s.Serve(context.Background(), c.in, c.out)
 }
