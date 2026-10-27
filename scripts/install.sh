@@ -1,9 +1,9 @@
 #!/bin/sh
-# Installs the smem binary from a GitHub release of the private
-# rahulsub/synapse-mem repo. Needs a token that can read the repo, in
-# GH_TOKEN or GITHUB_TOKEN (no SSH alias needed).
+# Installs the smem binary from a GitHub release of rahulsub/synapse-mem
+# and verifies its checksum. GH_TOKEN or GITHUB_TOKEN is optional; it
+# raises GitHub's API rate limit.
 #
-#   GH_TOKEN=... sh install.sh [version] [dir]
+#   sh install.sh [version] [dir]
 #
 # version defaults to the latest release; dir to $SMEM_INSTALL_DIR or
 # ~/.local/bin. On agents with an ephemeral home, pick a persistent dir.
@@ -12,7 +12,6 @@ repo=rahulsub/synapse-mem
 version=${1:-latest}
 dir=${2:-${SMEM_INSTALL_DIR:-$HOME/.local/bin}}
 token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
-[ -n "$token" ] || { echo "set GH_TOKEN to a token that can read $repo" >&2; exit 1; }
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 case $(uname -m) in
@@ -25,7 +24,8 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 # The token goes in a private header file, never on a command line where
 # other users could read it with ps.
 umask 077
-printf 'Authorization: Bearer %s\n' "$token" > "$tmp/auth"
+: > "$tmp/auth"
+[ -n "$token" ] && printf 'Authorization: Bearer %s\n' "$token" > "$tmp/auth"
 get() { curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -H @"$tmp/auth" "$@"; }
 
 api=https://api.github.com/repos/$repo/releases

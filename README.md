@@ -9,22 +9,20 @@ Design: [docs/DESIGN.md](docs/DESIGN.md) · Configuration: [docs/CONFIG.md](docs
 
 ## Install
 
-**Binary**, from a GitHub release, with any token that can read the repo
-(no SSH setup needed):
+**Binary**, from a GitHub release (macOS and Linux, arm64 and amd64). The
+script verifies the checksum:
 
 ```sh
-GH_TOKEN=… sh scripts/install.sh            # latest; or: sh scripts/install.sh v0.3.0 /persist/bin
+curl -fsSL https://raw.githubusercontent.com/rahulsub/synapse-mem/main/scripts/install.sh | sh
+# or a version and directory: sh install.sh v0.4.0 /persist/bin
 ```
 
-It verifies the checksum. On agents whose home directory doesn't survive a
-restart, install to persistent storage.
+On agents whose home directory doesn't survive a restart, install to
+persistent storage.
 
-**From source.** The repo is private, so Go must skip the public proxy and
-fetch with a key that has access (here the `github.com-rahulsub` SSH alias):
+**With Go** (1.27+; no cgo needed):
 
 ```sh
-export GOPRIVATE=github.com/rahulsub/*
-git config --global url."git@github.com-rahulsub:rahulsub/".insteadOf "https://github.com/rahulsub/"
 go install github.com/rahulsub/synapse-mem/cmd/smem@latest
 ```
 
@@ -46,12 +44,9 @@ smem init --claude-code     # writes .mcp.json and the hooks in .claude/settings
 **As a plugin, per user:**
 
 ```
-/plugin marketplace add git@github.com-rahulsub:rahulsub/synapse-mem.git
+/plugin marketplace add rahulsub/synapse-mem
 /plugin install smem@synapse-mem
 ```
-
-(`rahulsub/synapse-mem` works too where the default GitHub credentials can
-read the repo.)
 
 The plugin adds the `smem` MCP server (memory and decision tools), the
 session-start and post-tool-use hooks, and a skill on when to use them. It
@@ -66,13 +61,14 @@ project on first use, already git-ignored except `config.json`.
 
 Tools: `memory_recall`, `memory_context`, `memory_remember`, `memory_update`,
 `memory_invalidate`, `memory_signal`, `decision_record`, `decision_outcome`,
-`why`, `review`, `factcheck`.
+`why`, `review`, `factcheck`, `failure_record`, `rule_propose`, `rules_list`.
+Any of them can be turned off with `mcp.disable`.
 
 ### Go
 
 ```go
 e, err := smem.Open(".smem/smem.db")
-cfg, _ := smem.LoadConfig(smem.ConfigPath(e.Path()))
+cfg, _ := smem.LoadConfigFor(e.Path()) // project config + local config
 e.Configure(cfg) // judges from TYPESAFE_API_KEY / ANTHROPIC_API_KEY
 id, err := e.Remember(smem.MemoryInput{Kind: "fact", Content: "..."})
 ```
@@ -252,3 +248,38 @@ the API keys. Details and limits: DESIGN.md §7.
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | Enables the Claude judge |
 | `ANTHROPIC_BASE_URL` + `ANTHROPIC_CUSTOM_HEADERS` | Claude judge through a gateway (headers are `Name: value` lines) |
 | `SMEM_JUDGE_MODEL` | Claude judge model for this agent, e.g. a gateway-prefixed id |
+
+## Contributing
+
+Contributions are welcome: bug reports, fixes, new checkers or judges,
+transports, docs. To get started:
+
+```sh
+git clone https://github.com/rahulsub/synapse-mem && cd synapse-mem
+make check         # what CI runs: formatting, tidy, vet, golangci-lint, race tests
+make build         # bin/smem
+```
+
+1. **Open an issue first** for anything bigger than a small fix, so we can
+   agree on the approach before you write it.
+2. **Fork, branch, and open a pull request** against `main`. Every PR runs
+   lint (golangci-lint with gosec and staticcheck), race tests on Linux and
+   macOS with a coverage gate, fuzzing, cross-builds, govulncheck, gitleaks,
+   dependency review and CodeQL. `ci-ok` must pass.
+3. **Keep PRs focused**, one change per PR, with a test that fails without
+   your change.
+4. **Mind the invariants.** These are the things that are easy to break:
+   * event payloads are a wire format, so add fields and never rename them;
+   * projections must stay a pure function of the log (`Rebuild` must
+     reproduce them);
+   * nothing that can run code or redirect credentials may be settable from
+     the committed project config;
+   * secrets are redacted before anything is signed.
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the details: layout, testing,
+style, and how to add a judge, checker or MCP tool. Report security issues
+privately (see [SECURITY.md](SECURITY.md)), not in a public issue.
+
+## License
+
+[MIT](LICENSE)
