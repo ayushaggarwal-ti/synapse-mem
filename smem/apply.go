@@ -329,6 +329,14 @@ func apply(tx *sql.Tx, ev Event) error {
 			a.status(p.ID, st, "", p.Reason)
 		}
 
+	case evJudgmentRecorded:
+		var p judgmentRecorded
+		if decode(&p) {
+			a.exec(`INSERT INTO judgments (id, subject, at, verdict, confidence, decided_by, action, reason, actor, event)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				p.ID, p.Subject, ev.At, p.Verdict.Label, p.Verdict.Confidence, p.DecidedBy, p.Action, p.Verdict.Reason, ev.Actor, ev.ID)
+		}
+
 	case evActionRecorded:
 		var p actionPayload
 		if decode(&p) {

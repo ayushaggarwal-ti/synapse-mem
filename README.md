@@ -50,6 +50,31 @@ smem keys trust key-…
 smem heads                                  # publish these hashes to anchor the log
 ```
 
+## Fact-checking
+
+```sh
+export TYPESAFE_API_KEY=…      # Jev: fast, calibrated
+export ANTHROPIC_API_KEY=…     # Claude Haiku 5.5: when Jev is unsure (optional)
+smem judges                    # what's configured
+smem factcheck mem-…           # or --due to check decayed facts
+```
+
+Write your own checks in any language. Each one gets the claim as JSON on
+stdin and prints a verdict, evidence, or nothing. Configure them in
+`.smem/config.json`:
+
+```json
+{
+  "checkers": [{"name": "port", "command": ["./check_port.py"], "match": "port \\d+"}],
+  "judges": {"claude": {"when": "escalate"}},
+  "factcheck": {"auto_accept": 0.8, "auto_reconfirm": 0.9}
+}
+```
+
+Checkers run first and a decisive one skips the models entirely. A confident
+contradiction marks a memory suspect (never invalid). Every check is a signed
+judgment you can trace with `smem why`.
+
 ## Claude Code hooks
 
 ```json
@@ -74,3 +99,5 @@ fail the agent.
 | `SMEM_ACTOR` | Who is writing (default `$USER`; hooks default to `claude-code`) |
 | `SMEM_SESSION` | Session id |
 | `SMEM_KEY_DIR` | Private keys (default: user config dir `smem/keys`) |
+| `TYPESAFE_API_KEY` / `OPENROUTER_API_KEY` | Enables the Jev judge |
+| `ANTHROPIC_API_KEY` | Enables the Claude judge |

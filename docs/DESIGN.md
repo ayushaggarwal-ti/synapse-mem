@@ -326,17 +326,111 @@ untrusted: every event is verified on import. `push` refuses if the remote
 copy of our own feed doesn't match the local log. Other transports (S3, HTTP,
 beads/Dolt) only need "read all feeds" and "append to my feed".
 
-## 9. Where to go next
+## 9. Fact-checking and judges
 
-1. **Semantic recall.** Add embeddings (sqlite-vec) as another relevance
+Confidence decays until something re-checks a memory. Fact-checking does that
+check automatically, cheapest step first:
+
+```
+memory ──▶ gather evidence ──▶ checkers ──▶ Jev ──▶ Claude (Haiku 5.5) ──▶ review
+           linked files,        user-written   fast,     only when Jev is unsure,
+           commits, similar     code; first    calibrated unavailable, or absent
+           memories             verdict wins   probabilities
+```
+
+**Typed questions** (`judge` package). Every judgment is a typed question:
+`Choice` (labels, a probability per label), `Probability` (P(yes)), or
+`Score` (ordered rubric). Any judge's answer can therefore be checked
+mechanically: is the choice one of the labels, do the probabilities sum to 1.
+A malformed answer is an error, never a default verdict. A fact-check asks two
+questions: `relation` (supports / contradicts / says_nothing) and
+`same_subject` (P(the evidence is about the same thing)). A contradiction only
+counts when `same_subject ≥ 0.5`.
+
+**Checkers** are user-written functions that run before any model:
+
+* Go: implement `smem.Checker`, or wrap a function with `smem.CheckFunc`, and
+  set `e.Checkers`.
+* Any language: a command in `.smem/config.json`. It gets the claim (memory
+  plus evidence) as JSON on stdin and prints `{"verdict": {...}}`,
+  `{"evidence": [...]}`, or nothing to abstain. Commands come only from local
+  config, never from synced data, because a synced command would be remote
+  code execution.
+
+A checker can decide (the first verdict wins and no model is called) or just
+contribute evidence for the judges.
+
+**Judges.** `TYPESAFE_API_KEY` (or `OPENROUTER_API_KEY`) enables Jev;
+`ANTHROPIC_API_KEY` enables Claude, Haiku 5.5 at low effort with structured
+outputs. A judge's answer settles the check at `auto_accept` (0.8). Otherwise
+the next judge is asked. A provider error is recorded and skipped, so an
+outage degrades to the next stage. Claude can also run `always` as a second
+opinion. If judges disagree, the check goes to review.
+
+**Calibration.** Jev returns probabilities from its output distribution;
+Claude reports its own confidence. Results carry `calibrated` so thresholds can
+be tuned per judge. Judgments plus later outcomes give the data to fit them.
+
+**Actions are asymmetric.** With `apply`:
+
+| Verdict | Action |
+|---|---|
+| supported, settled, ≥ `auto_reconfirm` (0.9) | reconfirm: resets the confidence clock |
+| contradicted, settled, same subject | mark **suspect** (never invalidate); dependents show as at-risk |
+| unsettled, or judges disagree | review queue (`smem review`) |
+| insufficient | nothing |
+
+Every check is a signed `judgment.recorded` event: verdict, who decided,
+each judge's answers, model, calibration, latency, usage, and evidence by
+reference and hash (not content). Any resulting suspicion names the judgment
+as its cause, so `smem why mem-…` shows exactly which judge said what.
+
+**What gets checked.** `smem factcheck --due` picks facts and insights whose
+confidence has decayed below a threshold, most salient first, skipping any
+checked in the last day. Preferences and episodes aren't fact-checked.
+Evidence and the claim are redacted before leaving the machine.
+
+## 10. Performance
+
+Measured on an M5 Ultra (`SMEM_SCALE=1 go test -run TestScale ./smem/`), with
+every write going through signing, chaining and projection:
+
+| Memories | Write | Recall (query) | Session context | Verify | Sync import | DB |
+|---|---|---|---|---|---|---|
+| 1,000 | 0.20 ms | 3 ms | 5 ms | 27 ms | ~20k events/s | 6 MB |
+| 10,000 | 0.21 ms | 9 ms | 44 ms | 0.26 s | ~20k events/s | 16 MB |
+| 50,000 | 0.27 ms | 12 ms | 59 ms | 1.3 s | ~18k events/s | 63 MB |
+
+The benchmark's vocabulary is deliberately small, so most memories match most
+queries; real text is easier. Verification is linear (≈26 µs/event) and is an
+audit operation, not a hot path. A fact-check is dominated by the judge's
+network latency, so checks run concurrently (`--parallel`, default 4); only
+the final write takes the database lock.
+
+Known costs as the store grows:
+
+* Every recall is an event and adds access rows. That's what makes the audit
+  trail show what an agent saw, and what drives reinforcement. At very high
+  recall rates, batch recall events or record only recalls whose results
+  were used.
+* Session context scores every memory (linear). Past ~100k memories,
+  pre-filter candidates by a maintained last-access column.
+* Sync re-reads whole feed files; track per-feed offsets for large logs.
+* One SQLite file per replica serializes writes (~4k writes/s). Many agents on
+  one machine share it fine. A fleet should use one replica per agent and sync.
+
+## 11. Where to go next
+
+1. **Rules governance.** Rules admitted only with a recorded reason (explicit
+   request, repeated incidents plus a test, or a decision), with duplicate
+   detection via the judge layer and `smem rules rationalize`.
+2. **Semantic recall.** Add embeddings (sqlite-vec) as another relevance
    signal next to bm25; `auth` should find "authentication".
 2. **Extraction and consolidation.** A pass at session end proposes memories
    and decisions from the transcript, as proposals the agent or user confirms.
    Repeated episodes become facts or procedures, linked by `derived_from`.
-3. **Assumption checking.** Run check hints in a sandbox, only from trusted
-   keys, and record `assumption.held` / `assumption.broken`. smem currently
-   stores hints but never executes them, since a hint from a peer is untrusted
-   input.
+3. **Assumption checking** through the same checker/judge cascade:
+   assumptions are claims too.
 4. **Key rotation and revocation** as signed events; a trusted-keys file that
    can be committed to a repo.
 5. **Evaluation.** Replay past sessions with `--known-at` and measure whether
@@ -347,7 +441,7 @@ beads/Dolt) only need "read all feeds" and "append to my feed".
 7. **Feed offsets.** Pull currently re-reads whole feed files; track offsets
    per feed for large logs.
 
-## 10. Code map
+## 12. Code map
 
 | File | Contents |
 |---|---|
@@ -363,4 +457,7 @@ beads/Dolt) only need "read all feeds" and "append to my feed".
 | `smem/verify.go` | Verification, heads, rebuild |
 | `smem/sync.go` | Import, export, directory remote |
 | `smem/hook.go` | Claude Code hook capture |
+| `smem/factcheck.go` | Checkers, evidence gathering, fact-check cascade, judgments |
+| `smem/config.go` | `.smem/config.json` and judge setup from the environment |
+| `judge/` | Typed questions, cascade, Jev and Claude judges |
 | `cmd/smem` | CLI |

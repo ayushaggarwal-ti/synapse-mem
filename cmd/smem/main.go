@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"synapse-mem/smem"
@@ -63,6 +65,11 @@ Keys and sync
   push [remote] | pull [remote]
   export [--replica id]    events as JSON lines on stdout
   import <file|->          verify and merge events
+
+Fact-checking
+  factcheck [mem...]       user checkers first, then judges (Jev, then Claude if unsure)
+                           --due --threshold --limit --parallel --dry-run --json
+  judges                   which judges and checkers are configured
 
 Setup
   init                     create .smem/smem.db here
@@ -127,6 +134,13 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	if *session != "" {
 		e.Session = *session
 	}
+	cfg, err := smem.LoadConfig(smem.ConfigPath(path))
+	if err != nil {
+		return err
+	}
+	if err := e.Configure(cfg); err != nil {
+		return err
+	}
 	c := &cli{e: e, in: stdin, out: stdout}
 	fn, ok := commands[cmd]
 	if !ok {
@@ -177,6 +191,7 @@ var commands = map[string]func(*cli, []string) error{
 	"heads": (*cli).heads, "rebuild": (*cli).rebuild, "keys": (*cli).keys, "remote": (*cli).remote,
 	"sync": (*cli).sync, "push": (*cli).push, "pull": (*cli).pull, "export": (*cli).export,
 	"import": (*cli).importCmd, "hook": (*cli).hook,
+	"factcheck": (*cli).factcheck, "judges": (*cli).judges,
 }
 
 // parse parses flags that may appear before, between or after positional args.
@@ -1033,6 +1048,87 @@ func (c *cli) hook(args []string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown hook %q", pos[0])
+}
+
+func (c *cli) factcheck(args []string) error {
+	fs := flag.NewFlagSet("factcheck", flag.ContinueOnError)
+	due := fs.Bool("due", false, "check memories whose confidence has decayed")
+	threshold := fs.Float64("threshold", 0.6, "with --due: confidence below which a memory is due")
+	limit := fs.Int("limit", 10, "with --due: max memories")
+	dry := fs.Bool("dry-run", false, "record the judgment but don't reconfirm or flag")
+	parallel := fs.Int("parallel", 4, "checks to run at once")
+	asJSON := fs.Bool("json", false, "JSON output")
+	ids, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if *due {
+		hits, err := c.e.FactCheckDue(*threshold, *limit)
+		if err != nil {
+			return err
+		}
+		for _, h := range hits {
+			ids = append(ids, h.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return errors.New("usage: smem factcheck <mem>... or --due")
+	}
+	// Judge calls dominate and run outside the database lock, so checks
+	// overlap well; results print in the order asked.
+	results := make([]*smem.FactCheckResult, len(ids))
+	errs := make([]error, len(ids))
+	sem := make(chan struct{}, max(*parallel, 1))
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			results[i], errs[i] = c.e.FactCheck(context.Background(), id, !*dry)
+		}()
+	}
+	wg.Wait()
+	for i, r := range results {
+		if errs[i] != nil {
+			return fmt.Errorf("%s: %w", ids[i], errs[i])
+		}
+		if *asJSON {
+			continue
+		}
+		c.printf("%s  %s %.2f by %s → %s\n    %s\n", r.Memory, r.Verdict.Label, r.Verdict.Confidence, r.DecidedBy, r.Action, oneLine(r.Content, 100))
+		if r.Verdict.Reason != "" {
+			c.printf("    why: %s\n", oneLine(r.Verdict.Reason, 160))
+		}
+		for _, t := range r.Trail {
+			a := t.Answers["relation"]
+			c.printf("    %s (%s): %s %.2f, same subject %.2f, %d ms\n", t.Judge, t.Model, a.Choice, a.Confidence,
+				t.Answers["same_subject"].Probability, t.LatencyMs)
+		}
+		for _, e := range r.Errors {
+			c.printf("    ! %s\n", e)
+		}
+	}
+	if *asJSON {
+		return c.json(results)
+	}
+	return nil
+}
+
+func (c *cli) judges(args []string) error {
+	names := c.e.Judges.Names()
+	if len(names) == 0 {
+		c.printf("judges: none (set TYPESAFE_API_KEY for Jev, ANTHROPIC_API_KEY for Claude)\n")
+	} else {
+		c.printf("judges, in order: %s\n", strings.Join(names, " → "))
+	}
+	if len(c.e.Checkers) == 0 {
+		c.printf("checkers: none (add them to %s)\n", smem.ConfigPath(c.e.Path()))
+	}
+	for _, k := range c.e.Checkers {
+		c.printf("checker: %s\n", k.Name())
+	}
+	return nil
 }
 
 func oneLine(s string, n int) string {

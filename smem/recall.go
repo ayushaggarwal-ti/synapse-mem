@@ -77,13 +77,14 @@ func (e *Engine) recordRecall(text string, hits []Scored) error {
 
 var wordRe = regexp.MustCompile(`[\p{L}\p{N}]+`)
 
-// matchExpr turns free text into an FTS5 query: any term, prefix-matched.
-func matchExpr(text string) string {
+// matchExpr turns free text into an FTS5 query over prefix-matched terms,
+// joined by op ("AND" or "OR").
+func matchExpr(text, op string) string {
 	var terms []string
 	for _, w := range wordRe.FindAllString(strings.ToLower(text), -1) {
 		terms = append(terms, `"`+w+`"*`)
 	}
-	return strings.Join(terms, " OR ")
+	return strings.Join(terms, " "+op+" ")
 }
 
 // score computes ranked candidates for q without recording anything.
@@ -103,29 +104,49 @@ func (e *Engine) score(q RecallQuery) ([]Scored, error) {
 
 	relevance := map[string]float64{}
 	var ids []string
-	if expr := matchExpr(q.Text); expr != "" {
-		rows, err := e.db.Query(`SELECT id, bm25(memories_fts) FROM memories_fts WHERE memories_fts MATCH ?
-			ORDER BY bm25(memories_fts) LIMIT 500`, expr)
-		if err != nil {
+	if expr := matchExpr(q.Text, "AND"); expr != "" {
+		// Memories matching every term rank best and keep the candidate set
+		// small; fall back to any term when that finds too few.
+		search := func(expr string) error {
+			rows, err := e.db.Query(`SELECT id, bm25(memories_fts) FROM memories_fts WHERE memories_fts MATCH ?
+				ORDER BY bm25(memories_fts) LIMIT 200`, expr)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var id string
+				var b float64
+				if err := rows.Scan(&id, &b); err != nil {
+					return err
+				}
+				if _, seen := relevance[id]; !seen {
+					relevance[id] = b
+					ids = append(ids, id)
+				}
+			}
+			return rows.Err()
+		}
+		if err := search(expr); err != nil {
 			return nil, err
 		}
-		best := 0.0
-		for rows.Next() {
-			var id string
-			var b float64
-			if err := rows.Scan(&id, &b); err != nil {
-				rows.Close()
+		if or := matchExpr(q.Text, "OR"); len(ids) < 20 && or != expr {
+			all := len(ids)
+			if err := search(or); err != nil {
 				return nil, err
 			}
-			relevance[id] = b
-			ids = append(ids, id)
-			best = math.Min(best, b)
+			for _, id := range ids[all:] {
+				relevance[id] *= 0.5 // any-term matches weigh half as much
+			}
 		}
-		rows.Close()
 		if len(ids) == 0 {
 			return nil, nil
 		}
-		// bm25 is negative, best is most negative; normalize into (0, 1].
+		// bm25 is negative; normalize so the best match is 1.
+		best := 0.0
+		for _, b := range relevance {
+			best = math.Min(best, b)
+		}
 		for id, b := range relevance {
 			if best < 0 {
 				relevance[id] = b / best

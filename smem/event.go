@@ -35,6 +35,7 @@ const (
 	evAssumptionBroken   = "assumption.broken"
 	evAssumptionHeld     = "assumption.held"
 	evActionRecorded     = "action.recorded"
+	evJudgmentRecorded   = "judgment.recorded"
 )
 
 // Event is one signed, hash-chained entry in a replica's feed.

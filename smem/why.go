@@ -84,6 +84,7 @@ type MemoryTrace struct {
 	UsedBy      []Link         `json:"used_by"`
 	Dependents  []Link         `json:"dependents"`
 	Signals     map[string]int `json:"signals"`
+	Judgments   []Judgment     `json:"judgments"`
 	History     []StatusEntry  `json:"history"`
 }
 
@@ -285,6 +286,9 @@ func (e *Engine) memoryTrace(id string) (*MemoryTrace, error) {
 		mt.Signals[s] = n
 	}
 	rows.Close()
+	if mt.Judgments, err = e.judgments(id); err != nil {
+		return nil, err
+	}
 	mt.History, err = e.history(id)
 	return mt, err
 }
@@ -418,6 +422,13 @@ func (t *Trace) Text() string {
 		}
 		if len(m.Signals) > 0 {
 			p("  signals: %v\n", m.Signals)
+		}
+		for _, j := range m.Judgments {
+			p("  fact-check %s %s: %s %.2f by %s → %s", j.ID, when(j.At), j.Verdict, j.Confidence, j.DecidedBy, j.Action)
+			if j.Reason != "" {
+				p(" (%s)", oneLine(j.Reason, 100))
+			}
+			p("\n")
 		}
 		writeHistory(&b, m.History)
 		p("\n")

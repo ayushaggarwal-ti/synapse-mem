@@ -22,6 +22,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"synapse-mem/judge"
 )
 
 // Engine is a handle on one smem database (one replica).
@@ -41,6 +43,11 @@ type Engine struct {
 	// PropagationDepth is how many hops an invalidation marks dependents
 	// suspect automatically. Anything further is reported as at-risk by Review.
 	PropagationDepth int
+	// Checkers run first in a fact-check, in order; Judges are asked when
+	// no checker decides. See Configure.
+	Checkers        []Checker
+	Judges          judge.Cascade
+	FactCheckPolicy FactCheckPolicy
 
 	keys map[string]ed25519.PrivateKey
 }

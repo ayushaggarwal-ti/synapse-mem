@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS key_trust (key_id TEXT PRIMARY KEY, trusted INTEGER N
 // viewTables are projections of the event log. Rebuild drops and replays them.
 var viewTables = []string{
 	"keys", "memories", "memories_fts", "decisions", "decisions_fts", "options",
-	"assumptions", "sources", "edges", "accesses", "actions", "approvals", "status_log",
+	"assumptions", "sources", "edges", "accesses", "actions", "approvals", "status_log", "judgments",
 }
 
 const viewsSchema = `
@@ -96,4 +96,10 @@ CREATE TABLE IF NOT EXISTS status_log (
 	reason TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT '', event TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS status_log_subject ON status_log(subject, at);
+CREATE TABLE IF NOT EXISTS judgments (
+	id TEXT PRIMARY KEY, subject TEXT NOT NULL, at INTEGER NOT NULL, verdict TEXT NOT NULL,
+	confidence REAL NOT NULL, decided_by TEXT NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+	actor TEXT NOT NULL DEFAULT '', event TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS judgments_subject ON judgments(subject, at);
 `

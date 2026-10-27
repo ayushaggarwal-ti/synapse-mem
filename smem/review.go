@@ -26,6 +26,8 @@ type Review struct {
 	// Conflicts are records with more than one live successor, usually
 	// because two replicas superseded the same thing independently.
 	Conflicts []ReviewItem `json:"conflicts"`
+	// FactCheck lists memories whose latest fact-check needs a person.
+	FactCheck []ReviewItem `json:"factcheck"`
 	// UntrustedKeys signed events here but are not trusted locally.
 	UntrustedKeys []Key `json:"untrusted_keys"`
 }
@@ -78,6 +80,14 @@ const conflictQuery = `
 		WHERE e.type = 'supersedes' AND d.status IN ('active', 'suspect')
 		GROUP BY e.dst HAVING COUNT(*) > 1`
 
+// factCheckQuery finds active memories whose latest judgment asked for review.
+const factCheckQuery = `
+	SELECT m.id, 'memory', m.status, m.content, j.id, j.verdict || ' ' || printf('%.2f', j.confidence) || ' by ' || j.decided_by ||
+		CASE WHEN j.reason != '' THEN ': ' || j.reason ELSE '' END, '', j.at
+	FROM memories m JOIN judgments j ON j.rowid = (SELECT rowid FROM judgments WHERE subject = m.id ORDER BY at DESC LIMIT 1)
+	WHERE m.status IN ('active', 'suspect') AND j.action = 'review'
+	ORDER BY j.at DESC`
+
 // Review lists everything that needs attention.
 func (e *Engine) Review() (*Review, error) {
 	rv := &Review{}
@@ -89,6 +99,9 @@ func (e *Engine) Review() (*Review, error) {
 		return nil, err
 	}
 	if rv.Conflicts, err = selectAll(e.db, scanReviewItem, conflictQuery); err != nil {
+		return nil, err
+	}
+	if rv.FactCheck, err = selectAll(e.db, scanReviewItem, factCheckQuery); err != nil {
 		return nil, err
 	}
 	keys, err := e.Keys()
