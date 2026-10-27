@@ -52,6 +52,7 @@ func TestFactCheckJudgesAndActions(t *testing.T) {
 
 	jev := &scripted{name: "jev", choice: "contradicts", conf: 0.93, subject: 0.9}
 	e.Judges = stages(jev)
+	e.FactCheckPolicy.MinAgreeing = 1 // one judge may act; TestNoSingleJudgeActs covers the default
 	res, err := e.FactCheck(context.Background(), old, true)
 	ok(t, err)
 	if res.Verdict.Label != Contradicted || res.Action != "suspected" || res.DecidedBy != "jev" {
@@ -86,6 +87,7 @@ func TestFactCheckEscalatesAndDisagreementGoesToReview(t *testing.T) {
 	jev := &scripted{name: "jev", choice: "contradicts", conf: 0.6, subject: 0.9}
 	claude := &scripted{name: "claude", choice: "supports", conf: 0.85, subject: 0.9}
 	e.Judges = stages(jev, claude)
+	e.FactCheckPolicy.MinAgreeing = 1
 	res, err := e.FactCheck(context.Background(), m, true)
 	ok(t, err)
 	if len(res.Trail) != 2 || res.Settled || res.Action != "review" || res.Verdict.Reason != "judges disagree" {
@@ -109,6 +111,7 @@ func TestFactCheckEscalatesAndDisagreementGoesToReview(t *testing.T) {
 	}
 
 	// A contradiction about a different subject doesn't count.
+	e.FactCheckPolicy.CacheTTL = -1 // same evidence, different judges: don't reuse
 	jev.err = nil
 	jev.choice, jev.conf, jev.subject = "contradicts", 0.95, 0.2
 	claude.choice, claude.conf = "says_nothing", 0.9
@@ -128,6 +131,7 @@ func TestCheckersRunFirstAndCanBeCommands(t *testing.T) {
 
 	jev := &scripted{name: "jev", choice: "supports", conf: 0.99, subject: 0.99}
 	e.Judges = stages(jev)
+	e.FactCheckPolicy.MinAgreeing = 1
 	portRe := regexp.MustCompile(`port (\d+)`)
 	e.Checkers = []Checker{CheckFunc("port", func(_ context.Context, cl Claim) (CheckResult, error) {
 		want := portRe.FindStringSubmatch(cl.Memory.Content)

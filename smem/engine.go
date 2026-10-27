@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -46,8 +47,26 @@ type Engine struct {
 	Checkers        []Checker
 	Judges          judge.Cascade
 	FactCheckPolicy FactCheckPolicy
+	// Policy holds the behavior settings from the config files.
+	Policy Policy
+	// AllowNewKey lets an actor that already signs this store start a new
+	// key when its private key is missing. Off by default: a missing key
+	// usually means the key directory was lost (an ephemeral $HOME), and
+	// silently becoming someone new would split the actor's history.
+	AllowNewKey bool
 
-	keys map[string]ed25519.PrivateKey
+	opts     OpenOptions
+	redactor *Redactor
+	keys     map[string]ed25519.PrivateKey
+	gaps     gapCache
+	beadRe   *regexp.Regexp
+}
+
+// OpenOptions tune how a database is opened.
+type OpenOptions struct {
+	// BusyTimeout is how long to wait for another process's write lock.
+	// Default 10s; hooks use less so they never outlast their own timeout.
+	BusyTimeout time.Duration
 }
 
 type execer interface {
@@ -55,7 +74,13 @@ type execer interface {
 }
 
 // Open opens or creates the database at path.
-func Open(path string) (*Engine, error) {
+func Open(path string) (*Engine, error) { return OpenWith(path, OpenOptions{}) }
+
+// OpenWith opens or creates the database at path with options.
+func OpenWith(path string, opts OpenOptions) (*Engine, error) {
+	if opts.BusyTimeout <= 0 {
+		opts.BusyTimeout = 10 * time.Second
+	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -68,7 +93,7 @@ func Open(path string) (*Engine, error) {
 			os.WriteFile(ignore, []byte("*\n!.gitignore\n!config.json\n"), 0o644)
 		}
 	}
-	dsn := "file:" + path + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_txlock=immediate"
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_txlock=immediate", path, opts.BusyTimeout.Milliseconds())
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -77,36 +102,148 @@ func Open(path string) (*Engine, error) {
 	// a second connection from the same process.
 	db.SetMaxOpenConns(1)
 	e := &Engine{
-		db: db, path: path, Now: time.Now, Actor: defaultActor(), Session: os.Getenv("SMEM_SESSION"),
+		db: db, path: path, Now: time.Now, Actor: defaultActor(""), Session: os.Getenv("SMEM_SESSION"),
 		KeyDir: DefaultKeyDir(), PropagationDepth: 1, keys: map[string]ed25519.PrivateKey{},
+		Policy: DefaultPolicy(), opts: opts, redactor: DefaultRedactor(),
 	}
-	if _, err := db.Exec(baseSchema + viewsSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("schema: %w", err)
+	e.FactCheckPolicy = DefaultFactCheckPolicy()
+	// Switching a new database to WAL takes an exclusive lock that SQLite
+	// doesn't wait for, so processes creating a store at the same moment
+	// can see SQLITE_BUSY. Retry briefly.
+	for attempt := 0; ; attempt++ {
+		err = e.setup()
+		if err == nil || attempt == 20 || !strings.Contains(err.Error(), "SQLITE_BUSY") {
+			break
+		}
+		time.Sleep(time.Duration(10+attempt*10) * time.Millisecond)
 	}
-	if e.replica, err = e.meta("replica_id"); err != nil {
+	if err != nil {
 		db.Close()
 		return nil, err
 	}
-	if e.replica == "" {
-		e.replica = newID("rep")
-		if err := e.setMeta("replica_id", e.replica); err != nil {
-			db.Close()
-			return nil, err
-		}
+	if err := e.configureBeads(); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return e, nil
 }
 
-func defaultActor() string {
+// setup creates or migrates the schema and settles the replica id.
+func (e *Engine) setup() error {
+	if _, err := e.db.Exec(baseSchema); err != nil {
+		return fmt.Errorf("schema: %w", err)
+	}
+	for _, m := range migrations {
+		var n int
+		if err := e.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, m.table, m.column).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := e.db.Exec(m.ddl); err != nil {
+				return fmt.Errorf("migrate %s.%s: %w", m.table, m.column, err)
+			}
+		}
+	}
+	if _, err := e.db.Exec(viewsSchema); err != nil {
+		return fmt.Errorf("schema: %w", err)
+	}
+	// Two processes opening a new store at once must agree on one id, so
+	// insert-if-absent and read back rather than read-then-write.
+	if _, err := e.db.Exec(`INSERT OR IGNORE INTO meta (key, value) VALUES ('replica_id', ?)`, newID("rep")); err != nil {
+		return err
+	}
+	var err error
+	if e.replica, err = e.meta("replica_id"); err != nil {
+		return err
+	}
+	if err := e.checkFileIdentity(); err != nil {
+		return err
+	}
+	if v, err := e.meta("views_version"); err != nil {
+		return err
+	} else if v != viewsVersion {
+		if err := e.Rebuild(); err != nil {
+			return err
+		}
+		return e.setMeta("views_version", viewsVersion)
+	}
+	return nil
+}
+
+// checkFileIdentity starts a new replica when the database file is a copy
+// (restored from a backup, or cloned to another machine). A copy that kept
+// writing under the old replica id would fork its chain for good: two files
+// claiming the same feed with different events. The new replica continues
+// from the copied events; the old chain stays as it was.
+func (e *Engine) checkFileIdentity() error {
+	id := fileIdentity(e.path)
+	if id == "" {
+		return nil
+	}
+	stored, err := e.meta("replica_file")
+	if err != nil {
+		return err
+	}
+	if stored != "" && stored != id {
+		var n int
+		if err := e.db.QueryRow(`SELECT COUNT(*) FROM events WHERE replica = ?`, e.replica).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			old := e.replica
+			e.replica = newID("rep")
+			if err := e.setMeta("replica_id", e.replica); err != nil {
+				return err
+			}
+			if err := e.setMeta("replica_previous", old); err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "smem: %s is a copy of replica %s; continuing as new replica %s\n", e.path, old, e.replica)
+		}
+	}
+	if stored != id {
+		return e.setMeta("replica_file", id)
+	}
+	return nil
+}
+
+// Clone opens a second handle on the same database with the same settings.
+// Each handle has its own connection, so a slow operation on one (a
+// fact-check waiting on a judge) doesn't hold up the other.
+func (e *Engine) Clone() (*Engine, error) {
+	c, err := OpenWith(e.path, e.opts)
+	if err != nil {
+		return nil, err
+	}
+	c.Now, c.Actor, c.Session, c.KeyDir = e.Now, e.Actor, e.Session, e.KeyDir
+	c.PropagationDepth, c.Checkers, c.Judges, c.FactCheckPolicy = e.PropagationDepth, e.Checkers, e.Judges, e.FactCheckPolicy
+	c.Policy, c.AllowNewKey, c.redactor, c.beadRe = e.Policy, e.AllowNewKey, e.redactor, e.beadRe
+	return c, nil
+}
+
+// defaultActor is $SMEM_ACTOR, or who@host: client (e.g. claude-code) if
+// given, else the user. Set an explicit actor (SMEM_ACTOR or "actor" in the
+// local config) for agents whose hostname changes on restart.
+func defaultActor(client string) string {
 	if a := os.Getenv("SMEM_ACTOR"); a != "" {
 		return a
 	}
-	if u := os.Getenv("USER"); u != "" {
-		return u
+	who := client
+	if who == "" {
+		who = os.Getenv("USER")
 	}
-	return "unknown"
+	if who == "" {
+		who = "unknown"
+	}
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return who + "@" + strings.Split(h, ".")[0]
+	}
+	return who
 }
+
+// DefaultActorFor is the actor a client such as claude-code signs as when
+// none is configured.
+func DefaultActorFor(client string) string { return defaultActor(client) }
 
 // Close closes the database.
 func (e *Engine) Close() error { return e.db.Close() }
@@ -162,8 +299,16 @@ func (w *wtx) signer() (ed25519.PrivateKey, string, error) {
 	priv, ok := w.e.keys[actor]
 	if !ok {
 		var err error
-		if priv, err = loadOrCreateKey(w.e.KeyDir, actor); err != nil {
+		if priv, err = loadKey(w.e.KeyDir, actor); err != nil {
 			return nil, "", err
+		}
+		if priv == nil {
+			if err := w.checkNewIdentity(actor); err != nil {
+				return nil, "", err
+			}
+			if priv, err = loadOrCreateKey(w.e.KeyDir, actor); err != nil {
+				return nil, "", err
+			}
 		}
 		w.e.keys[actor] = priv
 	}
@@ -186,6 +331,26 @@ func (w *wtx) signer() (ed25519.PrivateKey, string, error) {
 	return priv, kid, nil
 }
 
+// checkNewIdentity refuses to mint a second key for an actor that already
+// signs events in this replica, unless AllowNewKey is set.
+func (w *wtx) checkNewIdentity(actor string) error {
+	if w.e.AllowNewKey {
+		return nil
+	}
+	var kid string
+	err := w.tx.QueryRow(`SELECT key_id FROM keys WHERE actor = ? AND replica = ? ORDER BY registered_at DESC LIMIT 1`,
+		actor, w.e.replica).Scan(&kid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return fmt.Errorf("actor %q already signs this store with %s, but its private key is not in %s. "+
+		"The key directory was probably lost (is it on ephemeral storage?). Point SMEM_KEY_DIR or keys.dir "+
+		"in the local config at persistent storage that holds %s.ed25519, or set keys.allow_new to start a new identity",
+		actor, kid, w.e.KeyDir, unsafeName.ReplaceAllString(actor, "_"))
+}
+
 func (w *wtx) emit(typ, subject string, payload any) (Event, error) {
 	priv, kid, err := w.signer()
 	if err != nil {
@@ -197,7 +362,7 @@ func (w *wtx) emit(typ, subject string, payload any) (Event, error) {
 func (w *wtx) emitWith(priv ed25519.PrivateKey, kid, typ, subject string, payload any) (Event, error) {
 	// Redact before hashing: the log is append-only, so a secret that gets
 	// in can never be removed.
-	raw, err := redactPayload(payload)
+	raw, err := w.e.redactor.payload(payload)
 	if err != nil {
 		return Event{}, err
 	}

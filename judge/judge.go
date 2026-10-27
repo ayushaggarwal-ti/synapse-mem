@@ -177,6 +177,10 @@ func (q Question) check(a Answer) error {
 	return nil
 }
 
+// Check validates a result against the request's questions. A judge's
+// answer that fails it must not be used.
+func Check(req Request, res *Result) error { return checkAll(req, res) }
+
 func checkAll(req Request, res *Result) error {
 	for _, q := range req.Questions {
 		a, ok := res.Answers[q.ID]

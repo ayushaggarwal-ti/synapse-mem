@@ -291,6 +291,7 @@ var tools = []tool{
 	},
 	{
 		name: "factcheck",
+		slow: true,
 		desc: "Check memories against their sources and related memories, using the configured checkers and judges. Confidently supported memories are reconfirmed; confidently contradicted ones are marked suspect (never deleted).",
 		schema: obj(nil, map[string]any{
 			"ids":     strs("Memory ids to check. If empty, checks memories whose confidence has decayed."),

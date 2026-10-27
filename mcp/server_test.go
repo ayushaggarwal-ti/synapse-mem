@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/rahulsub/synapse-mem/judge"
 	"github.com/rahulsub/synapse-mem/smem"
 )
 
@@ -93,7 +96,7 @@ func TestHandshakeAndToolSchemas(t *testing.T) {
 	if init.ProtocolVersion != "2025-06-18" || init.ServerInfo.Version != "1.2.3" {
 		t.Fatalf("initialize: %s", rs[0].Result)
 	}
-	if e.Actor != "claude-code" {
+	if !strings.HasPrefix(e.Actor, "claude-code@") && e.Actor != "claude-code" {
 		t.Fatalf("actor should come from the client: %q", e.Actor)
 	}
 	var list struct {
@@ -206,5 +209,64 @@ func TestSessionFollowsHook(t *testing.T) {
 	session(t, &Server{Engine: e, Session: "explicit"}, call(1, "memory_recall", map[string]any{"query": "x"}))
 	if e.Session != "explicit" {
 		t.Fatal("an explicit session wins")
+	}
+}
+
+type slowJudge struct{ release chan struct{} }
+
+func (s slowJudge) Name() string { return "slow" }
+func (s slowJudge) Ask(ctx context.Context, r judge.Request) (*judge.Result, error) {
+	<-s.release
+	return nil, errors.New("gave up")
+}
+
+func TestFactCheckDoesNotBlockOtherCalls(t *testing.T) {
+	e := open(t)
+	release := make(chan struct{})
+	e.Judges = judge.Cascade{Stages: []judge.Stage{{Judge: slowJudge{release}}}}
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	s := &Server{Engine: e}
+	done := make(chan error)
+	go func() { done <- s.Serve(context.Background(), inR, outW); outW.Close() }()
+	dec := json.NewDecoder(outR)
+	send := func(m any) { b, _ := json.Marshal(m); inW.Write(append(b, '\n')) }
+	recv := func() reply { var r reply; dec.Decode(&r); return r }
+
+	send(call(1, "memory_remember", map[string]any{"content": "the api listens on port 8080", "kind": "fact"}))
+	out, _ := text(t, recv())
+	var mem struct{ ID string }
+	json.Unmarshal([]byte(out), &mem)
+	send(call(2, "memory_remember", map[string]any{"content": "the api moved to port 9090", "kind": "fact"}))
+	recv()
+	send(call(3, "factcheck", map[string]any{"ids": []string{mem.ID}}))
+	send(call(4, "memory_recall", map[string]any{"query": "api port"}))
+	if r := recv(); r.ID != 4 {
+		t.Fatalf("recall must answer while the fact-check waits on its judge; got id %d first", r.ID)
+	}
+	close(release)
+	if r := recv(); r.ID != 3 {
+		t.Fatalf("then the fact-check: %d", r.ID)
+	}
+	inW.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDisabledToolsAreHidden(t *testing.T) {
+	e := open(t)
+	e.Policy.MCP.Disable = []string{"memory_remember"}
+	e.Policy.MCP.Instructions = "Use bd remember for plain memories; smem for decisions."
+	rs := session(t, &Server{Engine: e},
+		map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{}},
+		map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+		call(3, "memory_remember", map[string]any{"content": "x", "kind": "fact"}),
+	)
+	if !strings.Contains(string(rs[0].Result), "bd remember") || strings.Contains(string(rs[1].Result), "memory_remember") {
+		t.Fatalf("instructions and tool list follow mcp config: %s %s", rs[0].Result, rs[1].Result)
+	}
+	if rs[2].Error == nil {
+		t.Fatal("a disabled tool can't be called")
 	}
 }

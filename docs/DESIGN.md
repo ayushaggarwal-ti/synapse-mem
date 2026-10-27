@@ -148,6 +148,22 @@ Historical queries (`--known-at`) compute salience and confidence from
 accesses up to that moment, so you can replay what an agent would have
 recalled then.
 
+**Active clock.** Salience decays on the agent's active time by default
+(`decay.clock`). Each stretch with no events from this replica counts as at
+most `decay.idle_after` (24h), including the current one. An agent that is
+off for two weeks comes back remembering what it knew. On the wall clock it
+would come back nearly empty. Confidence still decays on real time: whether
+a fact is still true doesn't depend on whether the agent was running. The
+idle stretches are cached and extended as new events arrive.
+
+**Being shown is not being used.** Session-start injection is logged (the
+audit trail shows what the agent was given) but doesn't count as an access,
+unless `context.reinforce` is set. Otherwise memories that are injected
+would stay salient just by being injected.
+
+**Contradictions are answered by verification.** Only contradictions since
+the memory was last asserted, reconfirmed or confirmed reduce confidence.
+
 ## 5. Provenance and propagation
 
 ### The graph
@@ -218,13 +234,37 @@ was done (hook-captured actions). When they disagree, that is worth seeing.
 ### Capture without relying on discipline
 
 * **Actions**: the Claude Code `PostToolUse` hook (`smem hook post-tool-use`)
-  records every mutating tool call: summary, hashes of input and output, the
-  transcript path, and the commit sha if the call was a `git commit`. It links
-  the action to the session's latest active decision. That is a heuristic;
-  `smem action --decision` is exact. Read-only tools are skipped unless `--all`.
+  captures every mutating tool call: a redacted summary, hashes of input and
+  output, the transcript path, the subagent id, and the commit sha if the
+  call was a `git commit`.
+  * By default it writes this to `.smem/spool/` and exits without touching
+    the database, so a busy store can never make the hook time out. The next
+    writer records spooled calls in one transaction: a CLI command, an MCP
+    call, or a session start. Each file is marked done in that same
+    transaction, so a crash can't record it twice.
+  * The hook finds the store from the `cwd` in its input, not from wherever
+    the hook process starts.
+  * Read-only tools, smem's own MCP tools and `hooks.skip_tools` are not
+    recorded.
+* **Linking actions to decisions** is inference from timing, and is
+  recorded as such (`linked_by`). By default (`hooks.link_decisions:
+  unambiguous`), a call is linked to the session's latest decision only if
+  no other decision was made in that session within `hooks.link_window`.
+  Parallel subagents making decisions therefore don't get each other's
+  actions. `smem action --decision` and `Decision:` trailers are exact.
+* **Sessions** are tied to processes. Claude Code doesn't tell an MCP
+  server which session it serves, but the server and the hooks share an
+  ancestor, the Claude Code process.
+  * The session-start hook records the session id under each ancestor's pid
+    in `.smem/sessions/`.
+  * The MCP server looks up its own ancestors, nearest first.
+  * Two sessions in one directory each find their own, and records of exited
+    processes are pruned.
 * **Context**: the `SessionStart` hook (`smem hook session-start`) injects
-  memories and records that injection as a recall, so the log shows what the
-  agent was given.
+  memories within `context.budget`, filtered by `scopes.read` and
+  `context.kinds`, for the start sources in `context.on` (startup and clear
+  by default, not resume or compact). It notes when synced events are
+  quarantined.
 * **Decisions**: the agent calls `smem decide`. (Extracting decisions it
   didn't record is future work, §9.)
 * **Commits**: `smem trailer <dec>` prints `Decision: dec-…` for the commit
@@ -313,9 +353,27 @@ impossible to modify. The guarantees are:
    append-only (a commit message, a chat channel) anchors the log even against
    someone who controls every key on the machine.
 
-**Trust** is local policy, like `known_hosts`: keys created locally are
-trusted; keys arriving by sync are listed as untrusted in `smem review` until
-`smem keys trust <key-id>`. Trust is not an event and is never synced.
+**Trust** is local policy, like `known_hosts`. Keys created locally are
+trusted. Keys arriving by sync are untrusted until `smem keys trust
+<key-id>`, or until they're listed in `trust.keys` in the local config.
+Trust is not an event and is never synced.
+
+**Untrusted events are quarantined, not applied.** Anyone who can write to
+a shared feed directory can produce validly signed events with a key of
+their own. So events from an untrusted key are stored and verified (chains
+stay intact and nothing is lost), but they are not projected. They never
+reach recall, session context, review or propagation. Changing trust
+replays the log, so trusting a key brings its events in, and distrusting
+one removes them from every view. `smem doctor`, `smem stats` and the
+session context report how many events are held back.
+
+**Identity is not silently replaced.** If an actor that already signs this
+replica has no private key in the key directory, writes are refused with
+an explanation. The usual cause is a key directory on ephemeral storage, such
+as an agent's `$HOME` that is lost on restart. Minting a new key would split
+the actor's history across identities. `keys.allow_new` starts a new key
+deliberately. `smem doctor` warns when the key directory is under a
+temporary path.
 
 ## 8. Local and sync
 
@@ -345,9 +403,22 @@ newest event.
 2. Require the next `rseq`, the right `prev`, a known key bound to the
    claimed actor, a correct hash and a valid signature. Stop at the first
    failure: nothing after a bad event is trusted.
-3. If any accepted event sorts before what is already projected, **replay**
-   the projections in order; otherwise apply incrementally.
-4. **Propagate locally.** The remote writer couldn't see our dependents (a
+3. **Bound time.**
+   * An event dated more than `sync.max_future_skew` (5 min) ahead is
+     refused until the clocks agree. Accepting it would drag every later
+     local timestamp forward.
+   * A feed whose time runs backwards is refused.
+   * An event older than `sync.max_backdate` (30 days) is kept exactly as
+     signed, but projected at the clamped time (stored locally as `eff_at`).
+     A backdated event therefore can't make as-of queries say something was
+     known earlier than it arrived.
+4. **Quarantine** events from untrusted keys (§7).
+5. If an accepted event sorts before what is already projected *and* is
+   **order-sensitive** (a status change, or a supersede where the first
+   successor wins), **replay** the projections in order. Inserts and access
+   records commute, so they are applied directly. In practice most late
+   arrivals are recalls and new memories, so a pull rarely replays the log.
+6. **Propagate locally.** The remote writer couldn't see our dependents (a
    decision made here using a memory invalidated there), so invalidations
    arriving by sync are propagated again. Records already flagged are left
    alone.
@@ -367,6 +438,25 @@ disk, Dropbox or a git repo (commit the directory). The directory is
 untrusted: every event is verified on import. `push` refuses if the remote
 copy of our own feed doesn't match the local log. Other transports (S3, HTTP,
 beads/Dolt) only need "read all feeds" and "append to my feed".
+
+**Robustness.**
+* **Torn writes:** a push writes all new lines in one write and syncs. A
+  reader skips a torn last line, and the feed's owner truncates it before
+  its next push. A feed that is broken mid-file is reported, and the other
+  feeds still import.
+* **New stores:** processes that create a store at the same moment agree on
+  one replica id (insert-if-absent, with a retry while the database is being
+  created).
+* **Copies:** the store records the identity of its database file (device
+  and inode). A restored backup or a copy to another machine sees a
+  different file and continues as a new replica. Continuing under the old
+  id would fork that replica's chain for good.
+
+**Pull-only remotes** (`smem remote add team <dir> --pull-only`) are read
+but never written. Combined with trust, this is how agents share memory
+read-only: a curator publishes a feed, agents pull it and trust only the
+curator's key, and each agent's own feed stays its own. `scopes.read`
+decides what each agent sees.
 
 ## 9. Fact-checking and judges
 
@@ -393,21 +483,53 @@ counts when `same_subject ≥ 0.5`.
 
 * Go: implement `smem.Checker`, or wrap a function with `smem.CheckFunc`, and
   set `e.Checkers`.
-* Any language: a command in `.smem/config.json`. It gets the claim (memory
-  plus evidence) as JSON on stdin and prints `{"verdict": {...}}`,
-  `{"evidence": [...]}`, or nothing to abstain. Commands come only from local
-  config, never from synced data, because a synced command would be remote
-  code execution.
+* Any language: a command in the **local** config (never `.smem/config.json`,
+  which may be committed, and never synced data: either would let someone
+  else run code on your machine). It gets the claim (memory plus evidence)
+  as JSON on stdin and prints `{"verdict": {...}}`, `{"evidence": [...]}`, or
+  nothing to abstain. It runs with a minimal environment (`PATH`, `HOME`,
+  `USER`, `LANG`, `LC_ALL`, `TZ`, `TMPDIR`) plus the variables its config
+  names. smem's API keys are never passed.
 
-A checker can decide (the first verdict wins and no model is called) or just
-contribute evidence for the judges.
+A checker's verdict counts as one check; it can also contribute evidence for
+the judges.
 
-**Judges.** `TYPESAFE_API_KEY` (or `OPENROUTER_API_KEY`) enables Jev;
-`ANTHROPIC_API_KEY` enables Claude, Haiku 5.5 at low effort with structured
-outputs. A judge's answer settles the check at `auto_accept` (0.8). Otherwise
-the next judge is asked. A provider error is recorded and skipped, so an
-outage degrades to the next stage. Claude can also run `always` as a second
-opinion. If judges disagree, the check goes to review.
+**Evidence** is limited to the project. A file source must resolve, symlinks
+included, to a regular file inside the directory holding `.smem`, must match
+`factcheck.evidence.allow`, and must not match the deny list: `.git`,
+`.smem`, `.beads`, `.env*`, keys and certificates, `.ssh`, `.aws`, `.netrc`,
+`.npmrc`, credential files, `*secret*` and Terraform state, plus anything
+configured. So a synced source pointing at `/proc/self/environ` or
+`../../.aws/credentials` reads nothing. Commit sources must be plain hashes,
+because a synced ref like `--output=…` would otherwise reach `git show` as an
+option.
+
+**Judges.**
+* **Jev** is enabled by `TYPESAFE_API_KEY` (or `OPENROUTER_API_KEY`).
+* **Claude** is enabled by `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`.
+  The default is Haiku 5.5 at low effort with structured outputs. The model,
+  effort and token limit are configurable, and `ANTHROPIC_BASE_URL` or
+  `endpoints.claude` points it at a gateway.
+* **Settling and escalation.** A judge's answer is confident at
+  `auto_accept` (0.8); otherwise the next judge is asked.
+* **Errors.** A provider error is recorded, and the next stage is asked.
+  `smem judges --ping` and `smem doctor --ping` surface errors that would
+  otherwise only appear as a fallback.
+
+**Agreement.** Acting on a memory needs `factcheck.min_agreeing` (default 2)
+independent checks that agree, where each checker verdict and each confident
+judge counts once.
+* With the default, no single judge can reconfirm a memory or mark it
+  suspect. Jev is weak on dates and numbers, so a confident Jev answer still
+  leads to Claude being asked for a second opinion.
+* A checker plus one judge counts as two.
+* Checks that disagree, or too few checks, send the memory to review.
+
+**Cost.** A judgment is cached by the hash of the claim and its evidence,
+for `cache_ttl` (24h). `daily_budget` caps judge calls per replica per 24
+hours; over budget, checks use checkers only and say so. In the MCP server
+a fact-check runs in the background on a second database handle, so other
+calls are never blocked behind it.
 
 **Calibration.** Jev returns probabilities from its output distribution;
 Claude reports its own confidence. Results carry `calibrated` so thresholds can
@@ -419,7 +541,7 @@ be tuned per judge. Judgments plus later outcomes give the data to fit them.
 |---|---|
 | supported, settled, ≥ `auto_reconfirm` (0.9) | reconfirm: resets the confidence clock |
 | contradicted, settled, same subject | mark **suspect** (never invalidate); dependents show as at-risk |
-| unsettled, or judges disagree | review queue (`smem review`) |
+| too few agreeing checks, or checks disagree | review queue (`smem review`) |
 | insufficient | nothing |
 
 Every check is a signed `judgment.recorded` event: verdict, who decided,
@@ -439,9 +561,8 @@ every write going through signing, chaining and projection:
 
 | Memories | Write | Recall (query) | Session context | Verify | Sync import | DB |
 |---|---|---|---|---|---|---|
-| 1,000 | 0.20 ms | 3 ms | 5 ms | 27 ms | ~20k events/s | 6 MB |
-| 10,000 | 0.21 ms | 9 ms | 44 ms | 0.26 s | ~20k events/s | 16 MB |
-| 50,000 | 0.27 ms | 12 ms | 59 ms | 1.3 s | ~18k events/s | 63 MB |
+| 10,000 | 0.24 ms | 3 ms | 46 ms | 0.26 s | ~25k events/s | 16 MB |
+| 50,000 | 0.28 ms | 11 ms | 57 ms | 1.3 s | ~25k events/s | 63 MB |
 
 The benchmark's vocabulary is deliberately small, so most memories match most
 queries; real text is easier. Verification is linear (≈26 µs/event) and is an
@@ -451,15 +572,25 @@ the final write takes the database lock.
 
 Known costs as the store grows:
 
-* Every recall is an event and adds access rows. That's what makes the audit
-  trail show what an agent saw, and what drives reinforcement. At very high
-  recall rates, batch recall events or record only recalls whose results
-  were used.
+* **Recall logging.** Every recall is an event and adds access rows. That's
+  what makes the audit trail show what an agent saw, and what drives
+  reinforcement. Repeats within `recall.dedupe_window` aren't logged again,
+  and session-start injection adds no access rows. The log still grows
+  without bound: an append-only signed log has no deletion. The planned
+  answer is a signed checkpoint (a snapshot of the projections plus the
+  heads it covers) that lets old segments be archived off the hot database
+  while staying verifiable. It's not built yet; `smem stats` shows the
+  growth rate.
 * Session context scores every memory (linear). Past ~100k memories,
   pre-filter candidates by a maintained last-access column.
 * Sync re-reads whole feed files; track per-feed offsets for large logs.
-* One SQLite file per replica serializes writes (~4k writes/s). Many agents on
-  one machine share it fine. A fleet should use one replica per agent and sync.
+* **Writes are serialized:** one SQLite file per replica (~4k writes/s).
+  Hooks never wait on that: post-tool-use spools, and session-start waits at
+  most `hooks.lock_timeout` (2s). Many agents on one machine can share a
+  store; a fleet should use one replica per agent and sync.
+* **Late events:** a sync import replays the log only when a late event is
+  order-sensitive (§8). Recalls and new memories arriving late are applied
+  directly.
 
 ## 11. Where to go next
 
@@ -473,14 +604,14 @@ Known costs as the store grows:
    Repeated episodes become facts or procedures, linked by `derived_from`.
 4. **Assumption checking** through the same checker/judge cascade:
    assumptions are claims too.
-5. **Key rotation and revocation** as signed events; a trusted-keys file that
-   can be committed to a repo.
-6. **Evaluation.** Replay past sessions with `--known-at` and measure whether
+5. **Key rotation and revocation** as signed events.
+6. **Log checkpoints** so old segments can be archived (§10).
+7. **Evaluation.** Replay past sessions with `--known-at` and measure whether
    recall surfaced what was later cited.
-7. **Beads integration.** Write `bd provenance` entries for decisions that
+8. **Beads integration.** Write `bd provenance` entries for decisions that
    name a bead, and file suspect decisions as beads so they show up in
    `bd ready`.
-8. **Feed offsets.** Pull currently re-reads whole feed files; track offsets
+9. **Feed offsets.** Pull currently re-reads whole feed files; track offsets
    per feed for large logs.
 
 ## 12. Code map
@@ -498,10 +629,12 @@ Known costs as the store grows:
 | `smem/why.go` | Traces and their text rendering |
 | `smem/verify.go` | Verification, heads, rebuild |
 | `smem/sync.go` | Import, export, directory remote |
-| `smem/hook.go` | Claude Code hook capture, current session |
+| `smem/hook.go` | Hook capture, spool, decision linking, process-tied sessions |
+| `smem/doctor.go` | `doctor`, `stats`, judge ping |
+| `smem/fileid_*.go` | Database file identity, for detecting copies |
 | `smem/redact.go` | Secret redaction, checker environment |
 | `smem/factcheck.go` | Checkers, evidence gathering, fact-check cascade, judgments |
-| `smem/config.go` | `.smem/config.json` and judge setup from the environment |
+| `smem/config.go` | Project and local config, policies, judges and checkers from config and environment |
 | `judge/` | Typed questions, cascade, Jev and Claude judges |
 | `mcp/` | MCP server (JSON-RPC over stdio) and its tools |
 | `cmd/smem` | CLI |

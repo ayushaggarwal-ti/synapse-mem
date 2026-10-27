@@ -39,6 +39,25 @@ func DefaultKeyDir() string {
 
 var unsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
+func keyPath(dir, actor string) string {
+	return filepath.Join(dir, unsafeName.ReplaceAllString(actor, "_")+".ed25519")
+}
+
+// loadKey returns the actor's signing key, or nil if there is none.
+func loadKey(dir, actor string) (ed25519.PrivateKey, error) {
+	b, err := os.ReadFile(keyPath(dir, actor))
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	seed, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil || len(seed) != ed25519.SeedSize {
+		return nil, fmt.Errorf("corrupt key file %s", keyPath(dir, actor))
+	}
+	return ed25519.NewKeyFromSeed(seed), nil
+}
+
 // loadOrCreateKey returns the actor's signing key, generating one on first use.
 func loadOrCreateKey(dir, actor string) (ed25519.PrivateKey, error) {
 	path := filepath.Join(dir, unsafeName.ReplaceAllString(actor, "_")+".ed25519")
@@ -110,7 +129,9 @@ func (e *Engine) Keys() ([]Key, error) {
 }
 
 // SetTrust records a local trust decision. Trust is policy, like ssh
-// known_hosts: it is not an event and is never replicated.
+// known_hosts: it is not an event and is never replicated. Changing it
+// replays the log, so a newly trusted key's quarantined events are projected
+// and a distrusted key's events disappear from every view.
 func (e *Engine) SetTrust(keyID string, trusted bool, note string) error {
 	var n int
 	if err := e.db.QueryRow(`SELECT COUNT(*) FROM keys WHERE key_id = ?`, keyID).Scan(&n); err != nil {
@@ -119,7 +140,37 @@ func (e *Engine) SetTrust(keyID string, trusted bool, note string) error {
 	if n == 0 {
 		return fmt.Errorf("unknown key %s", keyID)
 	}
-	_, err := e.db.Exec(`INSERT INTO key_trust (key_id, trusted, note) VALUES (?, ?, ?)
-		ON CONFLICT(key_id) DO UPDATE SET trusted = excluded.trusted, note = excluded.note`, keyID, trusted, note)
+	return e.setTrust(map[string]bool{keyID: trusted}, note)
+}
+
+// setTrust applies trust decisions, replaying the log if any changed.
+// Keys need not have been seen yet: trust can be configured in advance.
+func (e *Engine) setTrust(decisions map[string]bool, note string) error {
+	_, err := e.write(func(w *wtx) error {
+		changed := false
+		for kid, t := range decisions {
+			was, err := trusted(w.tx, kid)
+			if err != nil {
+				return err
+			}
+			if _, err := w.tx.Exec(`INSERT INTO key_trust (key_id, trusted, note) VALUES (?, ?, ?)
+				ON CONFLICT(key_id) DO UPDATE SET trusted = excluded.trusted, note = excluded.note`, kid, t, note); err != nil {
+				return err
+			}
+			changed = changed || was != t
+		}
+		if changed {
+			return rebuildViews(w.tx)
+		}
+		return nil
+	})
 	return err
+}
+
+// Quarantined counts events held back because their key is not trusted.
+func (e *Engine) Quarantined() (int, error) {
+	var n int
+	err := e.db.QueryRow(`SELECT COUNT(*) FROM events ev WHERE ev.type != ? AND NOT EXISTS
+		(SELECT 1 FROM key_trust t WHERE t.key_id = ev.key_id AND t.trusted = 1)`, evKeyRegistered).Scan(&n)
+	return n, err
 }

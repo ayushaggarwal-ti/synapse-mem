@@ -61,6 +61,17 @@ type Event struct {
 	Prev    string          `json:"prev"`
 	Hash    string          `json:"hash"`
 	Sig     string          `json:"sig"`
+	// EffAt is the time projections use: At, clamped on import so that a
+	// backdated event can't rewrite the past. Local, never hashed or synced.
+	EffAt int64 `json:"-"`
+}
+
+// effAt is the time projections use for ev.
+func (ev Event) effAt() int64 {
+	if ev.EffAt != 0 {
+		return ev.EffAt
+	}
+	return ev.At
 }
 
 func (ev *Event) digest() []byte {
@@ -121,7 +132,7 @@ func orderLess(a, b Event) bool {
 	return a.RSeq < b.RSeq
 }
 
-const eventCols = `seq, id, replica, rseq, at, actor, key_id, session, type, subject, payload, prev, hash, sig`
+const eventCols = `seq, id, replica, rseq, at, actor, key_id, session, type, subject, payload, prev, hash, sig, COALESCE(eff_at, 0)`
 
 type scanner interface{ Scan(...any) error }
 
@@ -129,16 +140,20 @@ func scanEvent(s scanner) (Event, error) {
 	var ev Event
 	var payload string
 	err := s.Scan(&ev.Seq, &ev.ID, &ev.Replica, &ev.RSeq, &ev.At, &ev.Actor, &ev.KeyID, &ev.Session,
-		&ev.Type, &ev.Subject, &payload, &ev.Prev, &ev.Hash, &ev.Sig)
+		&ev.Type, &ev.Subject, &payload, &ev.Prev, &ev.Hash, &ev.Sig, &ev.EffAt)
 	ev.Payload = json.RawMessage(payload)
 	return ev, err
 }
 
 func insertEvent(x execer, ev *Event) error {
-	res, err := x.Exec(`INSERT INTO events (id, replica, rseq, at, actor, key_id, session, type, subject, payload, prev, hash, sig)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	var eff any
+	if ev.EffAt != 0 && ev.EffAt != ev.At {
+		eff = ev.EffAt
+	}
+	res, err := x.Exec(`INSERT INTO events (id, replica, rseq, at, actor, key_id, session, type, subject, payload, prev, hash, sig, eff_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ev.ID, ev.Replica, ev.RSeq, ev.At, ev.Actor, ev.KeyID, ev.Session, ev.Type, ev.Subject,
-		string(ev.Payload), ev.Prev, ev.Hash, ev.Sig)
+		string(ev.Payload), ev.Prev, ev.Hash, ev.Sig, eff)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return fmt.Errorf("replica %s already has an event at rseq %d (fork): %w", ev.Replica, ev.RSeq, err)

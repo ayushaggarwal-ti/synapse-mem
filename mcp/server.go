@@ -1,12 +1,14 @@
 // Package mcp serves an smem store to agents over the Model Context Protocol
 // (JSON-RPC 2.0, one message per line on stdio).
 //
-// Requests are handled one at a time: the store has a single writer, and a
-// local agent sends one tool call at a time anyway.
+// Most requests are handled in order on one database handle. Slow tools (a
+// fact-check waits on remote judges) run in the background on a second
+// handle, so they never hold up recall or remember.
 package mcp
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +19,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rahulsub/synapse-mem/smem"
@@ -38,9 +41,15 @@ type Server struct {
 	Version string
 	// Session, if set, overrides the session the store's hook recorded.
 	Session string
-	// ActorFromClient signs as the connecting client (e.g. claude-code)
+	// ActorFromClient signs as the connecting client (e.g. claude-code@host)
 	// instead of Engine.Actor.
 	ActorFromClient bool
+
+	ancestors []int
+	out       sync.Mutex   // serializes responses
+	slow      sync.Mutex   // one background call at a time
+	bg        *smem.Engine // the background handle, created on first use
+	wg        sync.WaitGroup
 }
 
 var unsafeActor = regexp.MustCompile(`[^a-z0-9._-]+`)
@@ -66,9 +75,21 @@ type rpcError struct {
 
 // Serve reads requests from in and writes responses to out until in ends.
 func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
+	s.ancestors = smem.Ancestors()
+	defer func() {
+		s.wg.Wait()
+		if s.bg != nil {
+			s.bg.Close()
+		}
+	}()
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	enc := json.NewEncoder(out)
+	send := func(r response) error {
+		s.out.Lock()
+		defer s.out.Unlock()
+		return enc.Encode(r)
+	}
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -76,7 +97,7 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 		}
 		var req request
 		if err := json.Unmarshal(line, &req); err != nil {
-			if err := enc.Encode(response{JSONRPC: "2.0", ID: json.RawMessage("null"), Error: &rpcError{-32700, "parse error"}}); err != nil {
+			if err := send(response{JSONRPC: "2.0", ID: json.RawMessage("null"), Error: &rpcError{-32700, "parse error"}}); err != nil {
 				return err
 			}
 			continue
@@ -84,12 +105,90 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 		if len(req.ID) == 0 {
 			continue // a notification: nothing to answer
 		}
+		if t, args, ok := s.slowCall(req); ok {
+			s.syncSession()
+			session, actor := s.Engine.Session, s.Engine.Actor
+			if s.bg == nil { // cloned here, on the loop that owns s.Engine
+				bg, err := s.Engine.Clone()
+				if err != nil {
+					send(response{JSONRPC: "2.0", ID: req.ID, Result: textResult(err.Error(), true)})
+					continue
+				}
+				s.bg = bg
+			}
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				result, rerr := s.runSlow(ctx, t, args, session, actor)
+				send(response{JSONRPC: "2.0", ID: req.ID, Result: result, Error: rerr})
+			}()
+			continue
+		}
 		result, rerr := s.handle(ctx, req)
-		if err := enc.Encode(response{JSONRPC: "2.0", ID: req.ID, Result: result, Error: rerr}); err != nil {
+		if err := send(response{JSONRPC: "2.0", ID: req.ID, Result: result, Error: rerr}); err != nil {
 			return err
 		}
 	}
 	return sc.Err()
+}
+
+// slowCall reports whether req calls a slow tool, to run in the background.
+func (s *Server) slowCall(req request) (tool, json.RawMessage, bool) {
+	if req.Method != "tools/call" {
+		return tool{}, nil, false
+	}
+	var p struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if json.Unmarshal(req.Params, &p) != nil {
+		return tool{}, nil, false
+	}
+	t, ok := s.lookup(p.Name)
+	if !ok || !t.slow {
+		return tool{}, nil, false
+	}
+	if len(p.Arguments) == 0 {
+		p.Arguments = json.RawMessage("{}")
+	}
+	return t, p.Arguments, true
+}
+
+// runSlow runs a slow tool on the background handle, a clone of the main
+// one taken with the current session and actor.
+func (s *Server) runSlow(ctx context.Context, t tool, args json.RawMessage, session, actor string) (any, *rpcError) {
+	s.slow.Lock()
+	defer s.slow.Unlock()
+	s.bg.Session, s.bg.Actor = session, actor
+	return s.result(t.call(ctx, s.bg, args))
+}
+
+// lookup finds an enabled tool by name.
+func (s *Server) lookup(name string) (tool, bool) {
+	if slices.Contains(s.Engine.Policy.MCP.Disable, name) {
+		return tool{}, false
+	}
+	i := slices.IndexFunc(tools, func(t tool) bool { return t.name == name })
+	if i < 0 {
+		return tool{}, false
+	}
+	return tools[i], true
+}
+
+func (s *Server) result(out any, err error) (any, *rpcError) {
+	// Tool failures go back to the model as results it can act on, not as
+	// protocol errors.
+	if err != nil {
+		return textResult(err.Error(), true), nil
+	}
+	if p, ok := out.(plain); ok {
+		return textResult(string(p), false), nil
+	}
+	b, err := json.MarshalIndent(out, "", " ")
+	if err != nil {
+		return textResult(err.Error(), true), nil
+	}
+	return textResult(string(b), false), nil
 }
 
 func (s *Server) handle(ctx context.Context, req request) (any, *rpcError) {
@@ -103,7 +202,7 @@ func (s *Server) handle(ctx context.Context, req request) (any, *rpcError) {
 		}
 		json.Unmarshal(req.Params, &p)
 		if name := strings.Trim(unsafeActor.ReplaceAllString(strings.ToLower(p.ClientInfo.Name), "-"), "-."); s.ActorFromClient && name != "" {
-			s.Engine.Actor = name
+			s.Engine.Actor = smem.DefaultActorFor(name)
 		}
 		v := protocolVersions[0]
 		if slices.Contains(protocolVersions, p.ProtocolVersion) {
@@ -113,14 +212,16 @@ func (s *Server) handle(ctx context.Context, req request) (any, *rpcError) {
 			"protocolVersion": v,
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "smem", "version": s.Version},
-			"instructions":    instructions,
+			"instructions":    cmp.Or(s.Engine.Policy.MCP.Instructions, instructions),
 		}, nil
 	case "ping":
 		return map[string]any{}, nil
 	case "tools/list":
-		list := make([]map[string]any, len(tools))
-		for i, t := range tools {
-			list[i] = map[string]any{"name": t.name, "description": t.desc, "inputSchema": t.schema}
+		list := []map[string]any{}
+		for _, t := range tools {
+			if _, ok := s.lookup(t.name); ok {
+				list = append(list, map[string]any{"name": t.name, "description": t.desc, "inputSchema": t.schema})
+			}
 		}
 		return map[string]any{"tools": list}, nil
 	case "tools/call":
@@ -131,41 +232,33 @@ func (s *Server) handle(ctx context.Context, req request) (any, *rpcError) {
 		if err := json.Unmarshal(req.Params, &p); err != nil {
 			return nil, &rpcError{-32602, "invalid params"}
 		}
-		i := slices.IndexFunc(tools, func(t tool) bool { return t.name == p.Name })
-		if i < 0 {
+		t, ok := s.lookup(p.Name)
+		if !ok {
 			return nil, &rpcError{-32602, "unknown tool " + p.Name}
 		}
 		if len(p.Arguments) == 0 {
 			p.Arguments = json.RawMessage("{}")
 		}
 		s.syncSession()
-		out, err := tools[i].call(ctx, s.Engine, p.Arguments)
-		// Tool failures go back to the model as results it can act on,
-		// not as protocol errors.
-		if err != nil {
-			return textResult(err.Error(), true), nil
+		if _, err := s.Engine.DrainSpool(); err != nil {
+			fmt.Fprintln(os.Stderr, "smem mcp: spool:", err)
 		}
-		if p, ok := out.(plain); ok {
-			return textResult(string(p), false), nil
-		}
-		b, err := json.MarshalIndent(out, "", " ")
-		if err != nil {
-			return textResult(err.Error(), true), nil
-		}
-		return textResult(string(b), false), nil
+		return s.result(t.call(ctx, s.Engine, p.Arguments))
 	}
 	return nil, &rpcError{-32601, "method not found: " + req.Method}
 }
 
-// syncSession picks up the session the hook recorded most recently, so that
-// recalls, decisions and the hook's actions land in the same session.
+// syncSession files work under the session of the Claude Code process this
+// server belongs to (recorded by the session-start hook), so recalls,
+// decisions and the hook's tool calls line up. It runs on the main loop
+// only; background calls get a copy of the session when dispatched.
 func (s *Server) syncSession() {
 	switch {
 	case s.Session != "":
 		s.Engine.Session = s.Session
 	case os.Getenv("SMEM_SESSION") != "":
 	default:
-		if id := s.Engine.CurrentSession(); id != "" {
+		if id := s.Engine.SessionFor(s.ancestors); id != "" {
 			s.Engine.Session = id
 		}
 	}
@@ -179,12 +272,14 @@ func textResult(text string, isError bool) map[string]any {
 	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isError}
 }
 
-// tool is one MCP tool. call decodes its own arguments.
+// tool is one MCP tool. call decodes its own arguments. A slow tool runs
+// in the background.
 type tool struct {
 	name   string
 	desc   string
 	schema map[string]any
 	call   func(context.Context, *smem.Engine, json.RawMessage) (any, error)
+	slow   bool
 }
 
 // handler adapts a typed function to a tool call.

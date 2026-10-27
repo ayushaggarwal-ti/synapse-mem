@@ -1,6 +1,7 @@
 package smem
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -67,13 +68,13 @@ func TestScale(t *testing.T) {
 		}
 		verify := time.Since(t0)
 
-		var buf bytesBuffer
+		var buf bytes.Buffer
 		e.Export(&buf, "")
 		evs, _ := ReadEvents(&buf)
-		other := newEngine(t, "other", start())
+		other := newEngine(t, "other", c)
 		t0 = time.Now()
-		if _, err := other.Import(evs); err != nil {
-			t.Fatal(err)
+		if rep, err := other.Import(evs); err != nil || rep.Accepted != len(evs) {
+			t.Fatal(err, rep.Rejected)
 		}
 		imp := time.Since(t0)
 		st, _ := os.Stat(e.Path())
@@ -88,18 +89,6 @@ func TestScale(t *testing.T) {
 			imp.Round(time.Millisecond), float64(len(evs))/imp.Seconds(), float64(size)/1e6)
 		_ = filepath.Base
 	}
-}
-
-type bytesBuffer struct{ b []byte }
-
-func (w *bytesBuffer) Write(p []byte) (int, error) { w.b = append(w.b, p...); return len(p), nil }
-func (w *bytesBuffer) Read(p []byte) (int, error) {
-	if len(w.b) == 0 {
-		return 0, fmt.Errorf("EOF")
-	}
-	n := copy(p, w.b)
-	w.b = w.b[n:]
-	return n, nil
 }
 
 func splitComma(s string) []string {

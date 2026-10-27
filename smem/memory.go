@@ -152,6 +152,9 @@ func (e *Engine) Supersede(old string, in MemoryInput) (string, []Flag, error) {
 }
 
 func (e *Engine) assert(in MemoryInput, supersedes string) (string, []Flag, error) {
+	if in.Scope == "" {
+		in.Scope = e.Policy.Scopes.Write
+	}
 	if err := normalizeMemory(&in); err != nil {
 		return "", nil, err
 	}
@@ -169,7 +172,7 @@ func (e *Engine) assert(in MemoryInput, supersedes string) (string, []Flag, erro
 				p.DerivedFrom = append(p.DerivedFrom, ref)
 				continue
 			}
-			src := sourceCaptured{ID: newID("src"), Kind: guessSourceKind(ref), Ref: ref}
+			src := sourceCaptured{ID: newID("src"), Kind: w.e.sourceKind(ref), Ref: ref}
 			if _, err := w.emit(evSourceCaptured, src.ID, src); err != nil {
 				return err
 			}

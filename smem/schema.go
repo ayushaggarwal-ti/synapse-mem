@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS events (
 	prev     TEXT NOT NULL,
 	hash     TEXT NOT NULL,
 	sig      TEXT NOT NULL,
+	eff_at   INTEGER,              -- local: the clamped time projections use, if it differs from at
 	UNIQUE (replica, rseq)
 );
 CREATE INDEX IF NOT EXISTS events_order ON events(at, replica, rseq);
@@ -28,6 +29,7 @@ BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
 BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
 
+CREATE TABLE IF NOT EXISTS spool_seen (file TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS key_trust (key_id TEXT PRIMARY KEY, trusted INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '');
 `
@@ -99,7 +101,18 @@ CREATE INDEX IF NOT EXISTS status_log_subject ON status_log(subject, at);
 CREATE TABLE IF NOT EXISTS judgments (
 	id TEXT PRIMARY KEY, subject TEXT NOT NULL, at INTEGER NOT NULL, verdict TEXT NOT NULL,
 	confidence REAL NOT NULL, decided_by TEXT NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
-	actor TEXT NOT NULL DEFAULT '', event TEXT NOT NULL
+	actor TEXT NOT NULL DEFAULT '', input_hash TEXT NOT NULL DEFAULT '', judge_calls INTEGER NOT NULL DEFAULT 0,
+	replica TEXT NOT NULL DEFAULT '', event TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS judgments_subject ON judgments(subject, at);
 `
+
+// migrations bring an existing database up to the current base schema.
+// Views need none: a changed view schema is applied by rebuilding.
+var migrations = []struct{ table, column, ddl string }{
+	{"events", "eff_at", `ALTER TABLE events ADD COLUMN eff_at INTEGER`},
+}
+
+// viewsVersion changes whenever viewsSchema or apply changes in a way that
+// needs existing projections rebuilt.
+const viewsVersion = "3"

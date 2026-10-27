@@ -4,16 +4,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/rahulsub/synapse-mem/judge"
@@ -92,6 +95,8 @@ type CommandChecker struct {
 	Kinds   []string
 	Dir     string
 	Timeout time.Duration
+	// Env names environment variables passed through, beyond a minimal set.
+	Env []string
 }
 
 // Name implements Checker.
@@ -120,7 +125,7 @@ func (c *CommandChecker) Check(ctx context.Context, claim Claim) (CheckResult, e
 	}
 	cmd := exec.CommandContext(ctx, c.Command[0], c.Command[1:]...)
 	cmd.Dir = c.Dir
-	cmd.Env = checkerEnv()
+	cmd.Env = checkerEnv(c.Env)
 	cmd.Stdin = bytes.NewReader(in)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -152,14 +157,46 @@ type FactCheckPolicy struct {
 	RelatedMemories int `json:"related_memories"`
 	// MaxEvidenceChars truncates each evidence item.
 	MaxEvidenceChars int `json:"max_evidence_chars"`
+	// MinAgreeing is how many independent checks (each checker verdict and
+	// each judge counts once) must agree before a memory is reconfirmed or
+	// marked suspect. Below it the result goes to review. Default 2, so no
+	// single judge can change a memory on its own.
+	MinAgreeing int `json:"min_agreeing"`
+	// CacheTTL reuses a judgment when the claim and evidence are unchanged.
+	CacheTTL Duration `json:"cache_ttl"`
+	// DailyBudget caps judge calls per replica per 24 hours (0 = no cap).
+	DailyBudget int `json:"daily_budget"`
+	// Evidence limits which files can be read as evidence. Deny patterns
+	// add to DefaultEvidenceDeny.
+	Evidence EvidencePolicy `json:"evidence"`
 }
 
-// DefaultFactCheckPolicy is used for zero fields.
-var DefaultFactCheckPolicy = FactCheckPolicy{AutoAccept: 0.8, AutoReconfirm: 0.9, SubjectAt: 0.5,
-	RelatedMemories: 3, MaxEvidenceChars: 4000}
+// EvidencePolicy limits file evidence to the project. Paths outside the
+// directory holding .smem are never read, symlinks included. Patterns are
+// globs relative to that directory; ** matches any number of directories.
+type EvidencePolicy struct {
+	Allow    []string `json:"allow"`
+	Deny     []string `json:"deny"`
+	MaxBytes int64    `json:"max_bytes"`
+}
+
+// DefaultEvidenceDeny keeps credentials and tool state out of evidence
+// sent to judges.
+var DefaultEvidenceDeny = []string{
+	".git/**", ".smem/**", ".beads/**", "**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx",
+	"**/id_rsa*", "**/id_ed25519*", "**/id_ecdsa*", "**/.ssh/**", "**/.aws/**", "**/.netrc", "**/.npmrc",
+	"**/.pypirc", "**/.git-credentials", "**/credentials*", "**/*secret*", "**/*.tfstate*",
+}
+
+// DefaultFactCheckPolicy returns the defaults used for unset fields.
+func DefaultFactCheckPolicy() FactCheckPolicy {
+	return FactCheckPolicy{AutoAccept: 0.8, AutoReconfirm: 0.9, SubjectAt: 0.5, RelatedMemories: 3,
+		MaxEvidenceChars: 4000, MinAgreeing: 2, CacheTTL: Duration(24 * time.Hour), DailyBudget: 500,
+		Evidence: EvidencePolicy{Allow: []string{"**"}, Deny: DefaultEvidenceDeny, MaxBytes: 256 << 10}}
+}
 
 func (p FactCheckPolicy) withDefaults() FactCheckPolicy {
-	d := DefaultFactCheckPolicy
+	d := DefaultFactCheckPolicy()
 	if p.AutoAccept > 0 {
 		d.AutoAccept = p.AutoAccept
 	}
@@ -174,6 +211,27 @@ func (p FactCheckPolicy) withDefaults() FactCheckPolicy {
 	}
 	if p.MaxEvidenceChars > 0 {
 		d.MaxEvidenceChars = p.MaxEvidenceChars
+	}
+	if p.MinAgreeing > 0 {
+		d.MinAgreeing = p.MinAgreeing
+	}
+	if p.CacheTTL != 0 {
+		d.CacheTTL = max(p.CacheTTL, 0)
+	}
+	if p.DailyBudget != 0 {
+		d.DailyBudget = max(p.DailyBudget, 0)
+	}
+	if p.Evidence.Allow != nil {
+		d.Evidence.Allow = p.Evidence.Allow
+	}
+	// Configured denials add to the defaults; they can't remove them.
+	for _, g := range p.Evidence.Deny {
+		if !contains(d.Evidence.Deny, g) {
+			d.Evidence.Deny = append(d.Evidence.Deny, g)
+		}
+	}
+	if p.Evidence.MaxBytes > 0 {
+		d.Evidence.MaxBytes = p.Evidence.MaxBytes
 	}
 	return d
 }
@@ -190,6 +248,7 @@ type FactCheckResult struct {
 	Judgment  string     `json:"judgment"` // id of the recorded judgment
 	Trail     []judgeRun `json:"trail"`
 	Errors    []string   `json:"errors,omitempty"`
+	Cached    bool       `json:"cached,omitempty"` // an earlier judgment of the same input was reused
 }
 
 // judgeRun is one judge's contribution, as recorded in the log.
@@ -219,6 +278,7 @@ type checkerRun struct {
 // and hash, not content: the log stays small and doesn't copy file contents.
 type judgmentRecorded struct {
 	ID        string        `json:"id"`
+	InputHash string        `json:"input_hash,omitempty"` // claim and evidence, for the cache
 	Subject   string        `json:"subject"`
 	Check     string        `json:"check"`
 	Verdict   Verdict       `json:"verdict"`
@@ -246,8 +306,9 @@ var factQuestions = []judge.Question{
 }
 
 // FactCheck checks one memory: user checkers first, then the judge cascade.
-// With apply, a confident "supported" reconfirms the memory and a confident
-// "contradicted" marks it suspect; nothing is ever invalidated
+// With apply, a supported claim is reconfirmed and a contradicted one is
+// marked suspect, but only when at least MinAgreeing independent checks
+// agree; otherwise it goes to review. Nothing is ever invalidated
 // automatically. The judgment is recorded as a signed event either way.
 func (e *Engine) FactCheck(ctx context.Context, id string, apply bool) (*FactCheckResult, error) {
 	m, err := e.Memory(id)
@@ -267,6 +328,9 @@ func (e *Engine) FactCheck(ctx context.Context, id string, apply bool) (*FactChe
 	if err != nil {
 		return nil, err
 	}
+	// Each agreeing check is one vote; a verdict needs pol.MinAgreeing.
+	votes := map[string]int{}
+	var checkerVerdict *Verdict
 	for _, c := range e.Checkers {
 		run := checkerRun{Name: c.Name()}
 		out, err := c.Check(ctx, claim)
@@ -289,20 +353,44 @@ func (e *Engine) FactCheck(ctx context.Context, id string, apply bool) (*FactChe
 				run.Error = "unknown verdict " + v.Label
 			} else {
 				run.Verdict = v
-				res.Verdict, res.DecidedBy, res.Settled = *v, "checker:"+c.Name(), v.Label != Insufficient
+				if v.Label != Insufficient && checkerVerdict == nil {
+					checkerVerdict = v
+					res.Verdict, res.DecidedBy, res.Settled = *v, "checker:"+c.Name(), true
+				}
+				if v.Label != Insufficient {
+					votes[v.Label]++
+				}
 			}
 		}
 		rec.Checkers = append(rec.Checkers, run)
-		if res.Settled {
+		if checkerVerdict != nil && votes[checkerVerdict.Label] >= pol.MinAgreeing {
 			break
 		}
 	}
 	for i := range claim.Evidence {
-		claim.Evidence[i].Text = truncate(Redact(claim.Evidence[i].Text), pol.MaxEvidenceChars)
+		claim.Evidence[i].Text = truncate(e.redactor.Redact(claim.Evidence[i].Text), pol.MaxEvidenceChars)
 	}
 	res.Evidence = claim.Evidence
+	rec.InputHash = inputHash(m, claim.Evidence)
 
-	if !res.Settled && len(claim.Evidence) > 0 && len(e.Judges.Stages) > 0 {
+	if cached, err := e.cachedJudgment(id, rec.InputHash, pol); err != nil {
+		return nil, err
+	} else if cached != nil {
+		cached.Content, cached.Evidence = m.Content, claim.Evidence
+		return cached, nil
+	}
+
+	needJudges := len(claim.Evidence) > 0 && len(e.Judges.Stages) > 0 &&
+		(checkerVerdict == nil || votes[checkerVerdict.Label] < pol.MinAgreeing)
+	if needJudges {
+		if left, err := e.judgeBudgetLeft(pol); err != nil {
+			return nil, err
+		} else if left <= 0 {
+			needJudges = false
+			res.Errors = append(res.Errors, fmt.Sprintf("daily judge budget (%d calls) used up; set factcheck.daily_budget to raise it", pol.DailyBudget))
+		}
+	}
+	if needJudges {
 		req := judge.Request{
 			Purpose: "Fact-check a stored memory against the evidence.",
 			State: map[string]any{
@@ -311,29 +399,60 @@ func (e *Engine) FactCheck(ctx context.Context, id string, apply bool) (*FactChe
 			},
 			Questions: factQuestions,
 		}
-		out := e.Judges.Ask(ctx, req, func(r *judge.Result) bool {
+		confident := func(r *judge.Result) bool {
 			v := factVerdict(r, pol)
 			return v.Label != Insufficient && v.Confidence >= pol.AutoAccept
-		})
-		res.Errors = append(res.Errors, out.Errors...)
-		for _, r := range out.Trail {
-			run := judgeRun{Judge: r.Judge, Model: r.Model, Calibrated: r.Calibrated, Answers: r.Answers,
-				Usage: r.Usage, LatencyMs: r.Latency.Milliseconds()}
-			res.Trail = append(res.Trail, run)
 		}
-		if out.Final != nil {
-			res.Verdict, res.DecidedBy, res.Settled = factVerdict(out.Final, pol), out.Final.Judge, out.Settled
-		}
-		// Judges that disagree on the relation leave it for a person.
-		if len(out.Trail) > 1 {
-			first := out.Trail[0].Answers["relation"].Choice
-			for _, r := range out.Trail[1:] {
-				if r.Answers["relation"].Choice != first {
-					res.Settled = false
-					res.Verdict.Reason = "judges disagree"
+		// Ask stages in order until one is confident; then keep asking the
+		// rest until enough checks agree. Always stages are always asked.
+		var final *judge.Result
+		for _, st := range e.Judges.Stages {
+			agreed := final != nil && votes[factVerdict(final, pol).Label] >= pol.MinAgreeing
+			if agreed && !st.Always {
+				continue
+			}
+			start := time.Now()
+			r, err := st.Judge.Ask(ctx, req)
+			if err == nil {
+				r.Latency = time.Since(start)
+				err = judge.Check(req, r)
+			}
+			if err != nil {
+				res.Errors = append(res.Errors, err.Error())
+				continue
+			}
+			res.Trail = append(res.Trail, judgeRun{Judge: r.Judge, Model: r.Model, Calibrated: r.Calibrated,
+				Answers: r.Answers, Usage: r.Usage, LatencyMs: r.Latency.Milliseconds()})
+			if confident(r) {
+				votes[factVerdict(r, pol).Label]++
+				if final == nil {
+					final = r
 				}
 			}
 		}
+		if final != nil && checkerVerdict == nil {
+			res.Verdict, res.DecidedBy, res.Settled = factVerdict(final, pol), final.Judge, true
+		} else if final == nil && checkerVerdict == nil && len(res.Trail) > 0 {
+			last := e.lastRun(res.Trail)
+			res.Verdict, res.DecidedBy = factVerdict(last, pol), last.Judge
+		}
+		// Checks that disagree on the relation leave it for a person.
+		if res.Verdict.Label != Insufficient && votes[Supported] > 0 && votes[Contradicted] > 0 {
+			res.Settled, res.Verdict.Reason = false, "checks disagree"
+		}
+		if len(res.Trail) > 1 {
+			first := res.Trail[0].Answers["relation"].Choice
+			for _, r := range res.Trail[1:] {
+				if r.Answers["relation"].Choice != first {
+					res.Settled, res.Verdict.Reason = false, "judges disagree"
+				}
+			}
+		}
+	}
+	if res.Settled && votes[res.Verdict.Label] < pol.MinAgreeing {
+		res.Settled = false
+		res.Verdict.Reason = strings.TrimSpace(fmt.Sprintf("%s (only %d of %d agreeing checks needed to act)",
+			res.Verdict.Reason, votes[res.Verdict.Label], pol.MinAgreeing))
 	}
 
 	switch {
@@ -377,6 +496,53 @@ func (e *Engine) FactCheck(ctx context.Context, id string, apply bool) (*FactChe
 	return res, err
 }
 
+func (e *Engine) lastRun(trail []judgeRun) *judge.Result {
+	r := trail[len(trail)-1]
+	return &judge.Result{Judge: r.Judge, Model: r.Model, Answers: r.Answers}
+}
+
+// inputHash identifies what a check looked at: the claim and the evidence.
+func inputHash(m Memory, evs []Evidence) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00", m.ID, m.Content)
+	for _, ev := range evs {
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00", ev.ID, ev.Kind, ev.Text)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:32]
+}
+
+// cachedJudgment returns the latest judgment of the same input within the
+// cache TTL, so an unchanged claim isn't sent to the judges again.
+func (e *Engine) cachedJudgment(id, input string, pol FactCheckPolicy) (*FactCheckResult, error) {
+	if pol.CacheTTL <= 0 {
+		return nil, nil
+	}
+	var jid, verdict, by, action, reason string
+	var conf float64
+	err := e.db.QueryRow(`SELECT id, verdict, confidence, decided_by, action, reason FROM judgments
+		WHERE subject = ? AND input_hash = ? AND at > ? ORDER BY at DESC LIMIT 1`,
+		id, input, ms(e.Now().Add(-pol.CacheTTL.D()))).Scan(&jid, &verdict, &conf, &by, &action, &reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	return &FactCheckResult{Memory: id, Verdict: Verdict{Label: verdict, Confidence: conf, Reason: reason},
+		DecidedBy: by, Action: "cached", Judgment: jid, Cached: true}, nil
+}
+
+// judgeBudgetLeft is how many judge calls this replica may still make in
+// the current 24 hours.
+func (e *Engine) judgeBudgetLeft(pol FactCheckPolicy) (int, error) {
+	if pol.DailyBudget <= 0 {
+		return math.MaxInt, nil
+	}
+	var used sql.NullInt64
+	err := e.db.QueryRow(`SELECT SUM(judge_calls) FROM judgments WHERE replica = ? AND at > ?`,
+		e.replica, ms(e.Now().Add(-24*time.Hour))).Scan(&used)
+	return pol.DailyBudget - int(used.Int64), err
+}
+
 // factVerdict turns a judge's answers into a verdict. A contradiction only
 // counts when the judge is confident the evidence is about the same thing.
 func factVerdict(r *judge.Result, pol FactCheckPolicy) Verdict {
@@ -409,17 +575,18 @@ func (e *Engine) gatherEvidence(m Memory, pol FactCheckPolicy) ([]Evidence, erro
 	for _, s := range srcs {
 		switch s.Kind {
 		case "file":
-			p := s.Ref
-			if !filepath.IsAbs(p) {
-				p = filepath.Join(root, p)
+			text, err := readEvidenceFile(root, s.Ref, pol.Evidence)
+			if err != nil {
+				text = "(not read: " + err.Error() + ")"
 			}
-			if b, err := os.ReadFile(p); err == nil {
-				out = append(out, Evidence{ID: s.ID, Kind: "file", Ref: s.Ref, Text: string(b)})
-			} else {
-				out = append(out, Evidence{ID: s.ID, Kind: "file", Ref: s.Ref, Text: "(file not found: " + s.Ref + ")"})
-			}
+			out = append(out, Evidence{ID: s.ID, Kind: "file", Ref: s.Ref, Text: text})
 		case "commit":
-			cmd := exec.Command("git", "show", "--stat", "--format=%H %ad%n%B", s.Ref)
+			// Sources can arrive by sync, so the ref must be a plain hash:
+			// anything else could be read by git as an option.
+			if !hexRef.MatchString(s.Ref) {
+				continue
+			}
+			cmd := exec.Command("git", "show", "--stat", "--format=%H %ad%n%B", s.Ref, "--")
 			cmd.Dir = root
 			if b, err := cmd.Output(); err == nil {
 				out = append(out, Evidence{ID: s.ID, Kind: "commit", Ref: s.Ref, Text: string(b)})
@@ -530,4 +697,78 @@ func cmp(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+// readEvidenceFile reads a file for evidence if the policy allows it. The
+// path must resolve, symlinks included, to a file inside root.
+func readEvidenceFile(root, ref string, pol EvidencePolicy) (string, error) {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	p := ref
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(root, p)
+	}
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return "", errors.New("file not found")
+	}
+	rel, err := filepath.Rel(realRoot, real)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", errors.New("outside the project")
+	}
+	rel = filepath.ToSlash(rel)
+	allowed := false
+	for _, g := range pol.Allow {
+		allowed = allowed || globMatch(g, rel)
+	}
+	for _, g := range pol.Deny {
+		if globMatch(g, rel) {
+			return "", fmt.Errorf("denied by evidence policy (%s)", g)
+		}
+	}
+	if !allowed {
+		return "", errors.New("not in factcheck.evidence.allow")
+	}
+	fi, err := os.Stat(real)
+	if err != nil || !fi.Mode().IsRegular() {
+		return "", errors.New("not a regular file")
+	}
+	f, err := os.Open(real)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, max(pol.MaxBytes, 1)))
+	return string(b), err
+}
+
+// globMatch matches a slash-separated path against a glob where * matches
+// within one segment and ** matches any number of segments.
+func globMatch(pattern, path string) bool {
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		switch {
+		case c == '*' && i+1 < len(pattern) && pattern[i+1] == '*':
+			i++
+			if i+1 < len(pattern) && pattern[i+1] == '/' {
+				i++
+				b.WriteString("(?:.*/)?")
+			} else {
+				b.WriteString(".*")
+			}
+		case c == '*':
+			b.WriteString("[^/]*")
+		case c == '?':
+			b.WriteString("[^/]")
+		default:
+			b.WriteString(regexp.QuoteMeta(string(c)))
+		}
+	}
+	b.WriteString("$")
+	re, err := regexp.Compile(b.String())
+	return err == nil && re.MatchString(path)
 }

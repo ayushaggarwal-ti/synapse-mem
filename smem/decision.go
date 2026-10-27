@@ -91,11 +91,12 @@ func scanDecision(s scanner) (Decision, error) {
 
 var hexRef = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 
-func guessSourceKind(ref string) string {
+// sourceKind classifies a free reference. Bead ids follow beads.prefixes.
+func (e *Engine) sourceKind(ref string) string {
 	switch {
 	case strings.HasPrefix(ref, "http://"), strings.HasPrefix(ref, "https://"):
 		return "url"
-	case strings.HasPrefix(ref, "bd-"):
+	case e.IsBead(ref):
 		return "bead"
 	case hexRef.MatchString(ref):
 		return "commit"
@@ -134,7 +135,7 @@ func (e *Engine) Decide(in DecisionInput) (string, []Flag, error) {
 				p.Evidence = append(p.Evidence, ref)
 				continue
 			}
-			src := sourceCaptured{ID: newID("src"), Kind: guessSourceKind(ref), Ref: ref}
+			src := sourceCaptured{ID: newID("src"), Kind: w.e.sourceKind(ref), Ref: ref}
 			if _, err := w.emit(evSourceCaptured, src.ID, src); err != nil {
 				return err
 			}
@@ -345,7 +346,7 @@ func (e *Engine) CaptureSource(kind, ref, contentHash, note string) (string, err
 		return "", errors.New("source ref is required")
 	}
 	if kind == "" {
-		kind = guessSourceKind(ref)
+		kind = e.sourceKind(ref)
 	}
 	p := sourceCaptured{ID: newID("src"), Kind: kind, Ref: ref, ContentHash: contentHash, Note: note}
 	_, err := e.write(func(w *wtx) error {

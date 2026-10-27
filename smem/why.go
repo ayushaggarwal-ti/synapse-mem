@@ -144,7 +144,10 @@ func (e *Engine) Why(ref string) (*Trace, error) {
 		t.Kind = "bead"
 		if t.Actions, err = e.actions(`bead = ?`, ref); err == nil {
 			var ids []string
-			if ids, err = e.strings(`SELECT id FROM decisions WHERE bead = ? ORDER BY decided_at`, ref); err == nil {
+			// Decisions for the bead, or citing it as evidence.
+			if ids, err = e.strings(`SELECT id FROM decisions WHERE bead = ? OR id IN
+				(SELECT e.src FROM edges e JOIN sources s ON s.id = e.dst WHERE e.type = 'evidenced_by' AND s.ref = ?)
+				ORDER BY decided_at`, ref, ref); err == nil {
 				err = e.addDecisions(t, ids...)
 			}
 		}

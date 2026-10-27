@@ -5,12 +5,22 @@ and disuse. Decisions record why they were made and get flagged when what
 they relied on changes. Everything is an Ed25519-signed, hash-chained,
 append-only event log that works locally or syncs between machines.
 
-Design: [docs/DESIGN.md](docs/DESIGN.md)
+Design: [docs/DESIGN.md](docs/DESIGN.md) · Configuration: [docs/CONFIG.md](docs/CONFIG.md)
 
 ## Install
 
-The repo is private, so Go must skip the public proxy and fetch with a key
-that has access (here the `github.com-rahulsub` SSH alias):
+**Binary**, from a GitHub release, with any token that can read the repo
+(no SSH setup needed):
+
+```sh
+GH_TOKEN=… sh scripts/install.sh            # latest; or: sh scripts/install.sh v0.3.0 /persist/bin
+```
+
+It verifies the checksum. On agents whose home directory doesn't survive a
+restart, install to persistent storage.
+
+**From source.** The repo is private, so Go must skip the public proxy and
+fetch with a key that has access (here the `github.com-rahulsub` SSH alias):
 
 ```sh
 export GOPRIVATE=github.com/rahulsub/*
@@ -18,10 +28,22 @@ git config --global url."git@github.com-rahulsub:rahulsub/".insteadOf "https://g
 go install github.com/rahulsub/synapse-mem/cmd/smem@latest
 ```
 
-Or download a binary from the GitHub release (darwin/linux, arm64/amd64),
-or build from a checkout with `make build` (`make dist` for every platform).
+Or build from a checkout with `make build` (`make dist` for every platform).
+
+Then run `smem doctor`. It checks the store, the config files, your identity
+and key, judges (`--ping` sends each a tiny question), trust, the spool and
+remotes.
 
 ### Claude Code
+
+**Per project, kept with the repo** (best for agents whose `~/.claude` is
+lost on restart):
+
+```sh
+smem init --claude-code     # writes .mcp.json and the hooks in .claude/settings.json, keeping what's there
+```
+
+**As a plugin, per user:**
 
 ```
 /plugin marketplace add git@github.com-rahulsub:rahulsub/synapse-mem.git
@@ -96,30 +118,44 @@ smem keys trust key-…
 smem heads                                  # publish these hashes to anchor the log
 ```
 
+Events signed by keys you haven't trusted are verified and stored but
+**quarantined**: never recalled or injected into a prompt until you trust
+the key (`smem keys trust`, or `trust.keys` in the local config). Imports
+refuse events dated in the future and clamp backdated ones. A restored or
+copied database continues as a new replica instead of forking the old one.
+
+**Team memory, read-only:** a curator pushes to a shared directory. Agents
+add it with `smem remote add team <dir> --pull-only`, trust only the
+curator's key, and choose what they see with `scopes.read`.
+
 ## Fact-checking
 
 ```sh
 export TYPESAFE_API_KEY=…      # Jev: fast, calibrated
 export ANTHROPIC_API_KEY=…     # Claude Haiku 5.5: when Jev is unsure (optional)
-smem judges                    # what's configured
+smem judges --ping             # what's configured, and whether each judge answers
 smem factcheck mem-…           # or --due to check decayed facts
 ```
 
 Write your own checks in any language. Each one gets the claim as JSON on
-stdin and prints a verdict, evidence, or nothing. Configure them in
+stdin and prints a verdict, evidence, or nothing. Checkers run code, so they
+go in the **local** config (`$SMEM_CONFIG`), never in the committed
 `.smem/config.json`:
 
 ```json
-{
-  "checkers": [{"name": "port", "command": ["./check_port.py"], "match": "port \\d+"}],
-  "judges": {"claude": {"when": "escalate"}},
-  "factcheck": {"auto_accept": 0.8, "auto_reconfirm": 0.9}
-}
+{"checkers": [{"name": "port", "command": ["/persist/checks/check_port.py"], "match": "port \\d+"}]}
 ```
 
-Checkers run first and a decisive one skips the models entirely. A confident
-contradiction marks a memory suspect (never invalid). Every check is a signed
-judgment you can trace with `smem why`.
+**Agreement.** Changing a memory takes two agreeing checks by default
+(`factcheck.min_agreeing`), where a checker or a judge each counts once. A
+single judge never reconfirms a memory or marks it suspect on its own;
+anything short of agreement goes to review.
+
+A contradiction marks a memory suspect, never invalid. Unchanged claims
+aren't re-judged within `cache_ttl`, and `daily_budget` caps judge calls.
+Evidence files must be inside the project and not on the deny list (`.env`,
+keys, `.git`, …). Every check is a signed judgment you can trace with
+`smem why`.
 
 ## Claude Code hooks
 
@@ -132,27 +168,50 @@ judgment you can trace with `smem why`.
 }
 ```
 
-The session-start hook injects the most salient memories within a budget and
-records that it did. The post-tool-use hook records each mutating tool call,
-including commit shas, linked to the session's current decision. Hooks never
-fail the agent.
+**Session start.** The hook injects the most salient memories in the
+session's scopes, within a budget. It does this on startup and `/clear`, not
+on resume or compact (`context.on`). Being shown doesn't count as being used.
+
+**Tool calls.** The post-tool-use hook spools each mutating tool call as a
+small redacted file, so it never waits on the database. The next writer
+records it, including commit shas. A call is linked to a decision only when
+that's unambiguous (`hooks.link_decisions`), so parallel subagents don't get
+each other's work.
+
+**General.** Hooks find the store from the session's working directory.
+They never fail the agent, unless `hooks.require_store` is set.
+
+## Configuration
+
+Everything that differs between teams is configuration. That includes bead
+prefixes (`dojo-…`), scopes, which MCP tools are on and the instructions the
+agent gets, decay, sync bounds, hook behavior, extra redaction patterns, and
+fact-check thresholds, cache and budget. Settings that are safe to commit go
+in `.smem/config.json`. Identity, keys, trust, judge endpoints and checkers
+go in the local config (`$SMEM_CONFIG`), which a cloned repo can't
+override. See [docs/CONFIG.md](docs/CONFIG.md), which includes a worked
+example for a beads-based fleet.
 
 ## Credentials
 
 API keys are read from the environment only and never stored. Every payload
 is redacted before it is signed, as is evidence before it goes to a judge.
 Redaction removes the exact values of credential-like environment variables,
-whatever their format, and common secret shapes in text. Command checkers
-don't get the judge keys. Details and limits: DESIGN.md §7.
+whatever their format, and common secret shapes in text: provider keys,
+Stripe/Google/AWS/GitHub/GitLab/Slack tokens, JWTs, PEM blocks and fragments,
+`*_KEY=` and similar assignments, auth headers, and URL passwords. Patterns
+can be added in config. Command checkers get a minimal environment and never
+the API keys. Details and limits: DESIGN.md §7.
 
 ## Environment
 
 | Variable | Meaning |
 |---|---|
 | `SMEM_DB` | Database path (default: nearest `.smem/smem.db`) |
-| `SMEM_ACTOR` | Who is writing (default `$USER`; hooks default to `claude-code`, MCP to the client's name) |
+| `SMEM_ACTOR` | Who is writing (default `user@host`; hooks `claude-code@host`, MCP `<client>@host`). Set it for agents |
+| `SMEM_CONFIG` | Local config file (default: user config dir `smem/config.json`) |
 | `SMEM_BIN` | Binary the Claude Code plugin runs (default: `smem` on `PATH`) |
 | `SMEM_SESSION` | Session id |
 | `SMEM_KEY_DIR` | Private keys (default: user config dir `smem/keys`) |
 | `TYPESAFE_API_KEY` / `OPENROUTER_API_KEY` | Enables the Jev judge |
-| `ANTHROPIC_API_KEY` | Enables the Claude judge |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | Enables the Claude judge (`ANTHROPIC_BASE_URL` for a gateway) |

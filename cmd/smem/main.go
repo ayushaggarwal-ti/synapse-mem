@@ -2,6 +2,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -62,7 +63,7 @@ Audit
 Keys and sync
   keys                     list signing keys
   keys trust|distrust <key-id>
-  remote add <name> <dir>  | remote list
+  remote add <name> <dir>  --pull-only (read-only source) | remote list
   sync [remote]            pull then push
   push [remote] | pull [remote]
   export [--replica id]    events as JSON lines on stdout
@@ -71,10 +72,12 @@ Keys and sync
 Fact-checking
   factcheck [mem...]       user checkers first, then judges (Jev, then Claude if unsure)
                            --due --threshold --limit --parallel --dry-run --json
-  judges                   which judges and checkers are configured
+  judges                   which judges and checkers are configured   --ping
 
 Setup
-  init                     create .smem/smem.db here
+  init                     create .smem/smem.db here   --claude-code (also write .mcp.json and hooks) --bin
+  doctor                   check the setup: store, keys, config, judges, trust, spool, remotes   --ping --json
+  stats                    what the store holds and how fast the log grows   --json
   mcp                      serve this store to an agent over MCP (stdio)   --init --session
   version                  print the version
   hook post-tool-use       record a Claude Code tool call (reads hook JSON on stdin)  --all
@@ -95,6 +98,10 @@ type cli struct {
 	e   *smem.Engine
 	in  io.Reader
 	out io.Writer
+	cfg *smem.Config
+	// actorSet is true when the actor was chosen explicitly (flag, config
+	// or SMEM_ACTOR) rather than defaulted.
+	actorSet bool
 }
 
 func run(args []string, stdin io.Reader, stdout io.Writer) error {
@@ -123,60 +130,147 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		return nil
 	}
 
-	path := findDB(*dbPath)
+	if cmd == "hook" {
+		return runHook(*dbPath, *actor, rest, stdin, stdout)
+	}
+	fn, ok := commands[cmd]
+	if !ok {
+		return fmt.Errorf("unknown command %q (see `smem help`)", cmd)
+	}
+	path := findDB(*dbPath, "")
 	switch {
 	case cmd == "init", cmd == "mcp" && path == "" && slices.Contains(rest, "--init"):
 		if path == "" || *dbPath == "" {
 			path = filepath.Join(".smem", "smem.db")
 		}
-	case path == "" && cmd == "hook":
-		return nil // hooks must never fail the agent just because smem isn't set up
+	case path == "" && cmd == "doctor":
+		return (&cli{in: stdin, out: stdout}).doctor(rest)
 	case path == "":
-		return errors.New("no smem database found; run `smem init` or pass --db")
+		return errors.New("no smem database found here or in any parent directory; run `smem init`, pass --db or set SMEM_DB")
+	}
+	cfg, err := smem.LoadConfigFor(path)
+	if err != nil {
+		return err
 	}
 	e, err := smem.Open(path)
 	if err != nil {
 		return err
 	}
 	defer e.Close()
+	if err := e.Configure(cfg); err != nil {
+		return err
+	}
 	if *actor != "" {
 		e.Actor = *actor
 	}
 	if *session != "" {
 		e.Session = *session
 	}
-	cfg, err := smem.LoadConfig(smem.ConfigPath(path))
-	if err != nil {
-		return err
+	if _, err := e.DrainSpool(); err != nil {
+		fmt.Fprintln(os.Stderr, "smem: recording spooled tool calls:", err)
 	}
-	if err := e.Configure(cfg); err != nil {
-		return err
-	}
-	c := &cli{e: e, in: stdin, out: stdout}
-	fn, ok := commands[cmd]
-	if !ok {
-		return fmt.Errorf("unknown command %q (see `smem help`)", cmd)
-	}
-	if cmd == "hook" {
-		// Report problems but never block the agent.
-		if err := fn(c, rest); err != nil {
-			fmt.Fprintln(os.Stderr, "smem hook:", err)
-		}
-		return nil
-	}
+	c := &cli{e: e, in: stdin, out: stdout, cfg: cfg, actorSet: *actor != "" || cfg.Actor != "" || os.Getenv("SMEM_ACTOR") != ""}
 	return fn(c, rest)
 }
 
-func findDB(explicit string) string {
+// runHook runs a Claude Code hook. Hooks read their input first, so the
+// store is found from the session's working directory (not wherever the
+// hook process happens to start), and they never fail the agent unless
+// hooks.require_store says a missing store is an error.
+func runHook(dbFlag, actorFlag string, args []string, stdin io.Reader, stdout io.Writer) error {
+	fs := flag.NewFlagSet("hook", flag.ContinueOnError)
+	all := fs.Bool("all", false, "also record read-only tools")
+	budget := fs.Int("budget", 0, "context budget (session-start; default context.budget)")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if err := need(pos, 1, "smem hook post-tool-use|session-start"); err != nil {
+		return err
+	}
+	var in smem.HookInput
+	if b, _ := io.ReadAll(stdin); len(b) > 0 {
+		if err := json.Unmarshal(b, &in); err != nil {
+			fmt.Fprintln(os.Stderr, "smem hook: input:", err)
+			return nil
+		}
+	}
+	path := findDB(dbFlag, in.Cwd)
+	if path == "" {
+		local, _ := smem.LoadConfig(smem.LocalConfigPath())
+		if local != nil && local.Hooks.RequireStore {
+			return fmt.Errorf("no smem store for %s (hooks.require_store is set)", cmp.Or(in.Cwd, "the working directory"))
+		}
+		return nil
+	}
+	if err := hook(path, actorFlag, pos[0], in, *all, *budget, stdout); err != nil {
+		fmt.Fprintln(os.Stderr, "smem hook:", err)
+	}
+	return nil
+}
+
+func hook(path, actorFlag, event string, in smem.HookInput, all bool, budget int, stdout io.Writer) error {
+	cfg, err := smem.LoadConfigFor(path)
+	if err != nil {
+		return err
+	}
+	if event == "post-tool-use" && cfg.Hooks.Spool {
+		return smem.SpoolToolUse(path, in, cfg, all)
+	}
+	e, err := smem.OpenWith(path, smem.OpenOptions{BusyTimeout: cfg.Hooks.LockTimeout.D()})
+	if err != nil {
+		return err
+	}
+	defer e.Close()
+	if err := e.Configure(cfg); err != nil {
+		return err
+	}
+	if actorFlag != "" {
+		e.Actor = actorFlag
+	} else if os.Getenv("SMEM_ACTOR") == "" && cfg.Actor == "" {
+		e.Actor = smem.DefaultActorFor("claude-code")
+	}
+	switch event {
+	case "post-tool-use":
+		_, err := e.RecordToolUse(in, all)
+		return err
+	case "session-start":
+		if in.SessionID != "" {
+			if err := e.SetCurrentSession(in.SessionID); err != nil {
+				return err
+			}
+		}
+		if _, err := e.DrainSpool(); err != nil {
+			return err
+		}
+		if in.Source != "" && !slices.Contains(cfg.Context.On, in.Source) {
+			return nil // context.on: nothing to inject for this kind of start
+		}
+		s, err := e.Context(budget)
+		if err != nil {
+			return err
+		}
+		fmt.Fprint(stdout, s)
+		return nil
+	}
+	return fmt.Errorf("unknown hook %q", event)
+}
+
+// findDB finds the store: an explicit path, $SMEM_DB, or the nearest
+// .smem/smem.db at or above start (default: the working directory).
+func findDB(explicit, start string) string {
 	if explicit != "" {
 		return explicit
 	}
 	if p := os.Getenv("SMEM_DB"); p != "" {
 		return p
 	}
-	dir, err := os.Getwd()
-	if err != nil {
-		return ""
+	dir := start
+	if dir == "" {
+		var err error
+		if dir, err = os.Getwd(); err != nil {
+			return ""
+		}
 	}
 	for {
 		p := filepath.Join(dir, ".smem", "smem.db")
@@ -201,8 +295,9 @@ var commands = map[string]func(*cli, []string) error{
 	"why": (*cli).why, "review": (*cli).review, "log": (*cli).log, "verify": (*cli).verify,
 	"heads": (*cli).heads, "rebuild": (*cli).rebuild, "keys": (*cli).keys, "remote": (*cli).remote,
 	"sync": (*cli).sync, "push": (*cli).push, "pull": (*cli).pull, "export": (*cli).export,
-	"import": (*cli).importCmd, "hook": (*cli).hook,
+	"import": (*cli).importCmd, "hook": nil,
 	"factcheck": (*cli).factcheck, "judges": (*cli).judges, "mcp": (*cli).mcp,
+	"doctor": (*cli).doctor, "stats": (*cli).stats,
 }
 
 // parse parses flags that may appear before, between or after positional args.
@@ -296,15 +391,88 @@ func (c *cli) flags(fl []smem.Flag) {
 // --- commands ---------------------------------------------------------------
 
 func (c *cli) initCmd(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	claude := fs.Bool("claude-code", false, "also wire Claude Code into this project: .mcp.json and hooks in .claude/settings.json")
+	bin := fs.String("bin", "smem", "with --claude-code: the smem command those files run")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
 	c.printf("smem database: %s\nreplica: %s\nactor: %s (keys in %s)\n", c.e.Path(), c.e.Replica(), c.e.Actor, c.e.KeyDir)
-	c.printf(`
-To capture Claude Code activity automatically, add to .claude/settings.json:
-  "hooks": {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "smem hook session-start"}]}],
-    "PostToolUse":  [{"hooks": [{"type": "command", "command": "smem hook post-tool-use"}]}]
-  }
-`)
+	if !*claude {
+		c.printf("\nTo wire up Claude Code in this project (kept with the repo, unlike a plugin install): smem init --claude-code\n")
+		return nil
+	}
+	root := filepath.Dir(filepath.Dir(c.e.Path()))
+	changed, err := wireClaudeCode(root, *bin)
+	if err != nil {
+		return err
+	}
+	for _, f := range changed {
+		c.printf("updated %s\n", f)
+	}
 	return nil
+}
+
+// wireClaudeCode adds the smem MCP server to .mcp.json and the hooks to
+// .claude/settings.json, keeping everything else in those files. These live
+// in the project, so they survive an agent whose home directory does not.
+func wireClaudeCode(root, bin string) ([]string, error) {
+	var changed []string
+	edit := func(rel string, fn func(map[string]any)) error {
+		p := filepath.Join(root, rel)
+		m := map[string]any{}
+		if b, err := os.ReadFile(p); err == nil {
+			if err := json.Unmarshal(b, &m); err != nil {
+				return fmt.Errorf("%s: %w", rel, err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		fn(m)
+		b, err := json.MarshalIndent(m, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return err
+		}
+		changed = append(changed, rel)
+		return os.WriteFile(p, append(b, '\n'), 0o644)
+	}
+	obj := func(m map[string]any, k string) map[string]any {
+		v, ok := m[k].(map[string]any)
+		if !ok {
+			v = map[string]any{}
+			m[k] = v
+		}
+		return v
+	}
+	if err := edit(".mcp.json", func(m map[string]any) {
+		obj(m, "mcpServers")["smem"] = map[string]any{"command": bin, "args": []string{"mcp", "--init"}}
+	}); err != nil {
+		return nil, err
+	}
+	err := edit(filepath.Join(".claude", "settings.json"), func(m map[string]any) {
+		hooks := obj(m, "hooks")
+		for event, sub := range map[string]string{"SessionStart": "session-start", "PostToolUse": "post-tool-use"} {
+			cmd := bin + " hook " + sub
+			groups, _ := hooks[event].([]any)
+			present := false
+			for _, g := range groups {
+				gm, _ := g.(map[string]any)
+				hs, _ := gm["hooks"].([]any)
+				for _, h := range hs {
+					hm, _ := h.(map[string]any)
+					present = present || hm["command"] == cmd
+				}
+			}
+			if !present {
+				hooks[event] = append(groups, map[string]any{"matcher": "", "hooks": []any{
+					map[string]any{"type": "command", "command": cmd, "timeout": 10}}})
+			}
+		}
+	})
+	return changed, err
 }
 
 func memoryFlags(fs *flag.FlagSet) (*smem.MemoryInput, func() error) {
@@ -497,7 +665,7 @@ func (c *cli) recall(args []string) error {
 
 func (c *cli) context(args []string) error {
 	fs := flag.NewFlagSet("context", flag.ContinueOnError)
-	budget := fs.Int("budget", 4000, "max characters")
+	budget := fs.Int("budget", 0, "max characters (default context.budget)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -888,18 +1056,27 @@ func (c *cli) keys(args []string) error {
 		return err
 	}
 	for _, k := range ks {
-		t := "untrusted"
+		t := "untrusted (quarantined)"
 		if k.Trusted {
 			t = "trusted"
 		}
-		c.printf("%s  %-12s %-9s %d events  replica %s\n", k.KeyID, k.Actor, t, k.Events, k.Replica)
+		c.printf("%s  %-24s %-23s %d events  replica %s\n", k.KeyID, k.Actor, t, k.Events, k.Replica)
 	}
 	return nil
 }
 
 func (c *cli) remote(args []string) error {
-	if len(args) >= 3 && args[0] == "add" {
-		return c.e.AddRemote(args[1], args[2])
+	if len(args) >= 1 && args[0] == "add" {
+		fs := flag.NewFlagSet("remote add", flag.ContinueOnError)
+		pullOnly := fs.Bool("pull-only", false, "read from it, never write (e.g. a team's shared memory)")
+		pos, err := parse(fs, args[1:])
+		if err != nil {
+			return err
+		}
+		if err := need(pos, 2, "smem remote add <name> <dir> [--pull-only]"); err != nil {
+			return err
+		}
+		return c.e.AddRemote(pos[0], pos[1], *pullOnly)
 	}
 	rs, err := c.e.Remotes()
 	if err != nil {
@@ -908,8 +1085,12 @@ func (c *cli) remote(args []string) error {
 	if len(rs) == 0 {
 		c.printf("no remotes (local only). Add one: smem remote add origin /path/to/shared/dir\n")
 	}
-	for n, d := range rs {
-		c.printf("%s  %s\n", n, d)
+	for n, r := range rs {
+		mode := ""
+		if r.PullOnly {
+			mode = "  (pull-only)"
+		}
+		c.printf("%s  %s%s\n", n, r.Dir, mode)
 	}
 	return nil
 }
@@ -927,11 +1108,11 @@ func (c *cli) pickRemote(args []string) (smem.DirRemote, error) {
 			name = n
 		}
 	}
-	dir, ok := rs[name]
+	r, ok := rs[name]
 	if !ok {
 		return smem.DirRemote{}, fmt.Errorf("no remote %q (smem remote add %s <dir>)", name, name)
 	}
-	return smem.DirRemote{Dir: dir}, nil
+	return r, nil
 }
 
 func (c *cli) report(rep *smem.ImportReport) {
@@ -940,6 +1121,12 @@ func (c *cli) report(rep *smem.ImportReport) {
 		c.printf(" (replayed projections)")
 	}
 	c.printf("\n")
+	if rep.Quarantined > 0 {
+		c.printf("  %d event(s) signed by untrusted keys are quarantined: not shown until `smem keys trust <key-id>`\n", rep.Quarantined)
+	}
+	if rep.Clamped > 0 {
+		c.printf("  %d backdated event(s) are projected at the clamped time (sync.max_backdate)\n", rep.Clamped)
+	}
 	for _, r := range rep.Rejected {
 		c.printf("  ✗ rejected %s\n", r)
 	}
@@ -958,7 +1145,9 @@ func (c *cli) sync(args []string) error {
 	if err != nil {
 		return err
 	}
-	c.printf("pushed %d event(s)\n", n)
+	if !r.PullOnly {
+		c.printf("pushed %d event(s)\n", n)
+	}
 	return nil
 }
 
@@ -966,6 +1155,9 @@ func (c *cli) push(args []string) error {
 	r, err := c.pickRemote(args)
 	if err != nil {
 		return err
+	}
+	if r.PullOnly {
+		return errors.New("that remote is pull-only")
 	}
 	n, err := c.e.Push(r)
 	if err != nil {
@@ -1023,46 +1215,6 @@ func (c *cli) importCmd(args []string) error {
 	return nil
 }
 
-func (c *cli) hook(args []string) error {
-	fs := flag.NewFlagSet("hook", flag.ContinueOnError)
-	all := fs.Bool("all", false, "also record read-only tools")
-	budget := fs.Int("budget", 4000, "context budget (session-start)")
-	pos, err := parse(fs, args)
-	if err != nil {
-		return err
-	}
-	if err := need(pos, 1, "smem hook post-tool-use|session-start"); err != nil {
-		return err
-	}
-	var in smem.HookInput
-	if b, _ := io.ReadAll(c.in); len(b) > 0 {
-		if err := json.Unmarshal(b, &in); err != nil {
-			return fmt.Errorf("hook input: %w", err)
-		}
-	}
-	if os.Getenv("SMEM_ACTOR") == "" && c.e.Actor == os.Getenv("USER") {
-		c.e.Actor = "claude-code"
-	}
-	switch pos[0] {
-	case "post-tool-use":
-		_, err := c.e.RecordToolUse(in, *all)
-		return err
-	case "session-start":
-		if in.SessionID != "" {
-			if err := c.e.SetCurrentSession(in.SessionID); err != nil {
-				return err
-			}
-		}
-		s, err := c.e.Context(*budget)
-		if err != nil {
-			return err
-		}
-		c.printf("%s", s)
-		return nil
-	}
-	return fmt.Errorf("unknown hook %q", pos[0])
-}
-
 func (c *cli) factcheck(args []string) error {
 	fs := flag.NewFlagSet("factcheck", flag.ContinueOnError)
 	due := fs.Bool("due", false, "check memories whose confidence has decayed")
@@ -1110,6 +1262,9 @@ func (c *cli) factcheck(args []string) error {
 			continue
 		}
 		c.printf("%s  %s %.2f by %s → %s\n    %s\n", r.Memory, r.Verdict.Label, r.Verdict.Confidence, r.DecidedBy, r.Action, oneLine(r.Content, 100))
+		if r.Cached {
+			c.printf("    (unchanged since judgment %s; reused)\n", r.Judgment)
+		}
 		if r.Verdict.Reason != "" {
 			c.printf("    why: %s\n", oneLine(r.Verdict.Reason, 160))
 		}
@@ -1129,17 +1284,33 @@ func (c *cli) factcheck(args []string) error {
 }
 
 func (c *cli) judges(args []string) error {
+	fs := flag.NewFlagSet("judges", flag.ContinueOnError)
+	ping := fs.Bool("ping", false, "send each judge a tiny question and report what happens")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
 	names := c.e.Judges.Names()
 	if len(names) == 0 {
-		c.printf("judges: none (set TYPESAFE_API_KEY for Jev, ANTHROPIC_API_KEY for Claude)\n")
+		c.printf("judges: none (TYPESAFE_API_KEY or OPENROUTER_API_KEY for Jev; ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN for Claude)\n")
 	} else {
 		c.printf("judges, in order: %s\n", strings.Join(names, " → "))
 	}
+	pol := c.e.FactCheckPolicy
+	c.printf("acting needs %d agreeing check(s); cache %s; daily budget %d judge calls\n", max(pol.MinAgreeing, 1), pol.CacheTTL.D(), pol.DailyBudget)
 	if len(c.e.Checkers) == 0 {
-		c.printf("checkers: none (add them to %s)\n", smem.ConfigPath(c.e.Path()))
+		c.printf("checkers: none (add them to the local config, %s)\n", cmp.Or(smem.LocalConfigPath(), "$SMEM_CONFIG"))
 	}
 	for _, k := range c.e.Checkers {
 		c.printf("checker: %s\n", k.Name())
+	}
+	if *ping {
+		for _, r := range smem.PingJudges(context.Background(), c.e.Judges) {
+			if r.Err != "" {
+				c.printf("  ✗ %s: %s\n", r.Judge, r.Err)
+			} else {
+				c.printf("  ✓ %s (%s) answered in %d ms\n", r.Judge, r.Model, r.LatencyMs)
+			}
+		}
 	}
 	return nil
 }
@@ -1159,7 +1330,67 @@ func (c *cli) mcp(args []string) error {
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
-	fromClient := os.Getenv("SMEM_ACTOR") == "" && c.e.Actor == os.Getenv("USER")
-	s := &mcp.Server{Engine: c.e, Version: version, Session: *session, ActorFromClient: fromClient}
+	s := &mcp.Server{Engine: c.e, Version: version, Session: *session, ActorFromClient: !c.actorSet}
 	return s.Serve(context.Background(), c.in, c.out)
+}
+
+func (c *cli) doctor(args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	ping := fs.Bool("ping", false, "also send each judge a tiny question")
+	asJSON := fs.Bool("json", false, "JSON output")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	var cfgErr error
+	if c.e == nil {
+		c.cfg, cfgErr = smem.LoadConfig(smem.LocalConfigPath())
+	}
+	checks := smem.Doctor(context.Background(), c.e, c.cfg, cfgErr, *ping)
+	if *asJSON {
+		return c.json(checks)
+	}
+	failed := false
+	for _, ch := range checks {
+		mark := map[string]string{"ok": "✓", "warn": "!", "fail": "✗"}[ch.Status]
+		c.printf("%s %-14s %s\n", mark, ch.Name, ch.Detail)
+		failed = failed || ch.Status == "fail"
+	}
+	if failed {
+		return errors.New("some checks failed")
+	}
+	return nil
+}
+
+func (c *cli) stats(args []string) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "JSON output")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	s, err := c.e.Stats()
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return c.json(s)
+	}
+	c.printf("events      %d (%d in the last 24h, %d in 7 days), %.1f MB\n", s.Events, s.Last24h, s.Last7d, float64(s.Bytes)/1e6)
+	types := make([]string, 0, len(s.ByType))
+	for t := range s.ByType {
+		types = append(types, t)
+	}
+	sort.Slice(types, func(i, j int) bool { return s.ByType[types[i]] > s.ByType[types[j]] })
+	for _, t := range types {
+		c.printf("  %-20s %d\n", t, s.ByType[t])
+	}
+	c.printf("replicas    %d\n", len(s.ByReplica))
+	c.printf("memories    %v\n", s.Memories)
+	c.printf("decisions   %d   actions %d   judgments %d\n", s.Decisions, s.Actions, s.Judgments)
+	if s.Quarantined > 0 {
+		c.printf("quarantined %d event(s) from untrusted keys\n", s.Quarantined)
+	}
+	if s.Spool > 0 {
+		c.printf("spool       %d tool call(s) waiting\n", s.Spool)
+	}
+	return nil
 }

@@ -5,6 +5,8 @@ description: How to use smem, the project's long-term memory and decision log. U
 
 # Using smem
 
+**Project instructions come first.** If CLAUDE.md, AGENTS.md or similar name a different tool for something (for example `bd remember` for plain memories, or beads for tasks), use that tool for it. Use smem for what they leave to it, usually decisions, provenance and "why". A project can turn off smem tools that overlap with its own (`mcp.disable` in `.smem/config.json`). Tools that are turned off don't appear.
+
 smem's tools (`memory_*`, `decision_*`, `why`, `review`, `factcheck`) are your memory across sessions. Memories fade unless they are used, and lose confidence as they age, so what you store and how you report on it decides what future sessions see.
 
 ## Recall before you act
@@ -34,4 +36,4 @@ Call `decision_record` for choices someone could reasonably question: an archite
 
 ## Answer "why?"
 
-For "why is it like this?" or "why did we do X?", call `why` with a decision or memory id, a commit sha or a bead id. Use `review` to see what has become doubtful since.
+For "why is it like this?" or "why did we do X?", call `why` with a decision or memory id, a commit sha or a bead id (in the project's prefix, e.g. `dojo-j6lv.1`). Use `review` to see what has become doubtful since.
