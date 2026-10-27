@@ -89,6 +89,18 @@ func Doctor(ctx context.Context, e *Engine, cfg *Config, cfgErr error, ping bool
 			}
 		}
 	}
+	if health, err := e.JudgeHealth(24 * time.Hour); err == nil {
+		for _, h := range health {
+			switch {
+			case h.Failed == 0:
+				add("judge "+h.Judge, "ok", "%d call(s) in 24h, none failed", h.OK)
+			case h.OK == 0:
+				add("judge "+h.Judge, "fail", "all %d call(s) in 24h failed; last: %s", h.Failed, h.LastError)
+			default:
+				add("judge "+h.Judge, "warn", "%d of %d call(s) in 24h failed; last: %s", h.Failed, h.OK+h.Failed, h.LastError)
+			}
+		}
+	}
 	if len(e.FactCheckPolicy.withDefaults().Evidence.Allow) == 0 {
 		add("evidence", "warn", "factcheck.evidence.allow is empty: no file evidence will be read")
 	}

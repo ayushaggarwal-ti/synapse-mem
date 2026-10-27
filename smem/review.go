@@ -30,6 +30,8 @@ type Review struct {
 	FactCheck []ReviewItem `json:"factcheck"`
 	// UntrustedKeys signed events here but are not trusted locally.
 	UntrustedKeys []Key `json:"untrusted_keys"`
+	// Judges lists judges with failed calls in the last 24 hours.
+	Judges []JudgeHealth `json:"judges,omitempty"`
 }
 
 func scanReviewItem(s scanner) (ReviewItem, error) {
@@ -111,6 +113,15 @@ func (e *Engine) Review() (*Review, error) {
 	for _, k := range keys {
 		if !k.Trusted {
 			rv.UntrustedKeys = append(rv.UntrustedKeys, k)
+		}
+	}
+	health, err := e.JudgeHealth(24 * time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range health {
+		if h.Failed > 0 {
+			rv.Judges = append(rv.Judges, h)
 		}
 	}
 	return rv, nil

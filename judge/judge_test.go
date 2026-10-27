@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2/option"
 )
@@ -81,8 +82,10 @@ func TestJevRetriesThenFailsWithoutLeakingBody(t *testing.T) {
 	defer srv.Close()
 	j := NewJev("k")
 	j.BaseURL = srv.URL
+	j.Retry = Retry{Attempts: 3, Base: time.Millisecond}
 	_, err := j.Ask(context.Background(), req)
-	if err == nil || calls != 3 || strings.Contains(err.Error(), "secret-echo") {
+	var he *HTTPError
+	if err == nil || calls != 3 || strings.Contains(err.Error(), "secret-echo") || !errors.As(err, &he) || he.Status != 503 {
 		t.Fatalf("calls %d err %v", calls, err)
 	}
 }

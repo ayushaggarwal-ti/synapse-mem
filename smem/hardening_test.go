@@ -5,6 +5,9 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -512,5 +515,68 @@ func TestPullOnlyRemoteIsNeverWritten(t *testing.T) {
 	}
 	if _, err := os.Stat(r.feedPath(agent.Replica())); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("nothing written to a pull-only remote")
+	}
+}
+
+// --- judges through a gateway -----------------------------------------------------
+
+func TestClaudeThroughGatewayHeaders(t *testing.T) {
+	var got http.Header
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(429)
+		io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"x"}}`)
+	}))
+	defer srv.Close()
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "gateway-token")
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "x-gateway-key: gw-agent-key-123456\nx-team: dojo")
+	t.Setenv("SMEM_JUDGE_MODEL", "my-gateway/claude-haiku-5-5")
+	t.Setenv("TYPESAFE_API_KEY", "")
+	t.Setenv("OPENROUTER_API_KEY", "")
+
+	c := start()
+	e := newEngine(t, "alice", c)
+	cfg := DefaultConfig()
+	cfg.Judges.Claude.MaxAttempts = 1
+	ok(t, e.Configure(cfg))
+	if names := e.Judges.Names(); len(names) != 1 || names[0] != "claude" {
+		t.Fatalf("base URL plus custom headers enable Claude: %v", names)
+	}
+	m := remember(t, e, "fact", "the release is on the 14th")
+	remember(t, e, "fact", "the release moved to the 21st")
+	res := must[*FactCheckResult](t)(e.FactCheck(context.Background(), m, true))
+
+	if got.Get("x-gateway-key") != "gw-agent-key-123456" || got.Get("x-team") != "dojo" || got.Get("Authorization") != "Bearer gateway-token" {
+		t.Fatalf("headers: %v", got)
+	}
+	if body["model"] != "my-gateway/claude-haiku-5-5" {
+		t.Fatalf("SMEM_JUDGE_MODEL: %v", body["model"])
+	}
+	sys, _ := json.Marshal(body["system"])
+	if strings.Contains(string(sys), "Claude Code") {
+		t.Fatal("smem does not present itself as Claude Code")
+	}
+	if !res.NotJudged || res.Action != "not-judged" || !strings.Contains(res.Verdict.Reason, "HTTP 429") {
+		t.Fatalf("a failed judge must say so, not look like no judge: %+v", res)
+	}
+	rv := must[*Review](t)(e.Review())
+	if len(rv.Judges) != 1 || rv.Judges[0].LastStatus != 429 || rv.Judges[0].OK != 0 {
+		t.Fatalf("review should show the failing judge: %+v", rv.Judges)
+	}
+
+	// The per-agent key is a secret: redacted on its own, never given to checkers.
+	r := must[*Redactor](t)(NewRedactor(RedactionPolicy{}))
+	if out := r.Redact("key is gw-agent-key-123456"); strings.Contains(out, "gw-agent") {
+		t.Fatalf("custom header value leaked: %q", out)
+	}
+	for _, kv := range checkerEnv([]string{"ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_BASE_URL"}) {
+		if strings.HasPrefix(kv, "ANTHROPIC_") {
+			t.Fatalf("checkers must not get %s", kv)
+		}
 	}
 }

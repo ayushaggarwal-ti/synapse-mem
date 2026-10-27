@@ -161,16 +161,35 @@ type JudgesConfig struct {
 		// Disabled turns Jev off even when a key is present.
 		Disabled bool   `json:"disabled"`
 		Model    string `json:"model"`
+		JudgeLimits
 	} `json:"jev"`
 	Claude struct {
 		// When is "escalate" (default: only when Jev is unsure or
 		// unavailable, or to make up min_agreeing), "always" (a second
 		// opinion on every check), or "never".
 		When      string `json:"when"`
-		Model     string `json:"model"`
+		Model     string `json:"model"` // SMEM_JUDGE_MODEL overrides, e.g. a gateway-prefixed id
 		Effort    string `json:"effort"`
 		MaxTokens int64  `json:"max_tokens"`
+		JudgeLimits
 	} `json:"claude"`
+}
+
+// JudgeLimits keeps a judge from overloading shared seats.
+type JudgeLimits struct {
+	// MaxAttempts per call, with exponential backoff from 1s (default 4).
+	MaxAttempts int `json:"max_attempts"`
+	// MaxConcurrent calls per process (default 2).
+	MaxConcurrent int `json:"max_concurrent"`
+}
+
+func (l JudgeLimits) apply(r *judge.Retry, lim *judge.Limiter) {
+	if l.MaxAttempts > 0 {
+		r.Attempts = l.MaxAttempts
+	}
+	if l.MaxConcurrent > 0 {
+		*lim = judge.NewLimiter(l.MaxConcurrent)
+	}
 }
 
 // EndpointsConfig points judges at other servers, such as a gateway.
@@ -383,6 +402,7 @@ func (e *Engine) configureJudges(cfg *Config) error {
 			if cfg.Judges.Jev.Model != "" {
 				j.Model = cfg.Judges.Jev.Model
 			}
+			cfg.Judges.Jev.apply(&j.Retry, &j.Limit)
 			stages = append(stages, judge.Stage{Judge: j})
 		}
 	}
@@ -390,16 +410,24 @@ func (e *Engine) configureJudges(cfg *Config) error {
 	if !contains([]string{"escalate", "always", "never"}, when) {
 		return fmt.Errorf("judges.claude.when must be escalate, always or never, not %q", when)
 	}
-	if when != "never" && (os.Getenv("ANTHROPIC_API_KEY") != "" || os.Getenv("ANTHROPIC_AUTH_TOKEN") != "") {
+	headers := customHeaders(os.Getenv("ANTHROPIC_CUSTOM_HEADERS"))
+	gateway := cmp(cfg.Endpoints.Claude, os.Getenv("ANTHROPIC_BASE_URL")) != "" && len(headers) > 0
+	if when != "never" && (os.Getenv("ANTHROPIC_API_KEY") != "" || os.Getenv("ANTHROPIC_AUTH_TOKEN") != "" || gateway) {
 		// The SDK reads the key or token and ANTHROPIC_BASE_URL itself.
+		// ANTHROPIC_CUSTOM_HEADERS is a Claude Code convention the SDK
+		// doesn't read, so it is passed on here.
 		var opts []option.RequestOption
 		if cfg.Endpoints.Claude != "" {
 			opts = append(opts, option.WithBaseURL(cfg.Endpoints.Claude))
 		}
-		c := judge.NewClaude(opts...)
-		if cfg.Judges.Claude.Model != "" {
-			c.Model = cfg.Judges.Claude.Model
+		for _, h := range headers {
+			opts = append(opts, option.WithHeader(h[0], h[1]))
 		}
+		c := judge.NewClaude(opts...)
+		if m := cmp(os.Getenv("SMEM_JUDGE_MODEL"), cfg.Judges.Claude.Model); m != "" {
+			c.Model = m
+		}
+		cfg.Judges.Claude.apply(&c.Retry, &c.Limit)
 		if cfg.Judges.Claude.Effort != "" {
 			c.Effort = anthropic.OutputConfigEffort(cfg.Judges.Claude.Effort)
 		}
@@ -475,4 +503,16 @@ func (e *Engine) IsBead(ref string) bool {
 		return false
 	}
 	return e.beadRe.MatchString(ref)
+}
+
+// customHeaders parses ANTHROPIC_CUSTOM_HEADERS: "Name: value" lines.
+func customHeaders(s string) [][2]string {
+	var out [][2]string
+	for _, line := range strings.Split(s, "\n") {
+		name, value, ok := strings.Cut(line, ":")
+		if name, value = strings.TrimSpace(name), strings.TrimSpace(value); ok && name != "" && value != "" {
+			out = append(out, [2]string{name, value})
+		}
+	}
+	return out
 }

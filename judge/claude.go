@@ -3,6 +3,7 @@ package judge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -18,14 +19,18 @@ type Claude struct {
 	Model     string
 	Effort    anthropic.OutputConfigEffort
 	MaxTokens int64
+	Retry     Retry
+	Limit     Limiter
 }
 
 // NewClaude returns a Claude judge, Claude Haiku 5.5 at low effort by
 // default. With no options the SDK reads ANTHROPIC_API_KEY (or an `ant auth`
 // profile).
 func NewClaude(opts ...option.RequestOption) *Claude {
+	// smem retries itself (Retry), so the SDK's own retries are off.
+	opts = append([]option.RequestOption{option.WithMaxRetries(0)}, opts...)
 	return &Claude{client: anthropic.NewClient(opts...), Model: "claude-haiku-5-5",
-		Effort: anthropic.OutputConfigEffortLow, MaxTokens: 4096}
+		Effort: anthropic.OutputConfigEffortLow, MaxTokens: 4096, Limit: NewLimiter(2)}
 }
 
 // Name implements Judge.
@@ -120,7 +125,11 @@ func (c *Claude) Ask(ctx context.Context, req Request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.client.Messages.New(ctx, anthropic.MessageNewParams{
+	if err := c.Limit.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer c.Limit.release()
+	params := anthropic.MessageNewParams{
 		Model:     c.Model,
 		MaxTokens: c.MaxTokens,
 		System:    []anthropic.TextBlockParam{{Text: claudeSystem}},
@@ -129,9 +138,22 @@ func (c *Claude) Ask(ctx context.Context, req Request) (*Result, error) {
 			Effort: c.Effort,
 			Format: anthropic.JSONOutputFormatParam{Schema: claudeSchema(req)},
 		},
+	}
+	var resp *anthropic.Message
+	err = c.Retry.do(ctx, "claude", func() (int, string, error) {
+		var err error
+		resp, err = c.client.Messages.New(ctx, params)
+		var apiErr *anthropic.Error
+		if errors.As(err, &apiErr) {
+			return apiErr.StatusCode, apiErrorType(apiErr), err
+		}
+		if err != nil {
+			return 0, "", err
+		}
+		return 200, "", nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("claude: %w", err)
+		return nil, err
 	}
 	switch resp.StopReason {
 	case anthropic.StopReasonRefusal:
@@ -198,3 +220,17 @@ func spread(labels []Label, chosen func(Label, int) bool, conf float64, key func
 }
 
 func clamp01(v float64) float64 { return min(max(v, 0), 1) }
+
+// apiErrorType is the error type from an API error body ("rate_limit_error",
+// "invalid_request_error"), without the message, which could echo input.
+func apiErrorType(e *anthropic.Error) string {
+	var body struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(e.RawJSON()), &body) == nil {
+		return body.Error.Type
+	}
+	return ""
+}

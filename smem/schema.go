@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS key_trust (key_id TEXT PRIMARY KEY, trusted INTEGER N
 // viewTables are projections of the event log. Rebuild drops and replays them.
 var viewTables = []string{
 	"keys", "memories", "memories_fts", "decisions", "decisions_fts", "options",
-	"assumptions", "sources", "edges", "accesses", "actions", "approvals", "status_log", "judgments",
+	"assumptions", "sources", "edges", "accesses", "actions", "approvals", "status_log", "judgments", "judge_runs",
 }
 
 const viewsSchema = `
@@ -105,6 +105,11 @@ CREATE TABLE IF NOT EXISTS judgments (
 	replica TEXT NOT NULL DEFAULT '', event TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS judgments_subject ON judgments(subject, at);
+CREATE TABLE IF NOT EXISTS judge_runs (
+	judgment TEXT NOT NULL, judge TEXT NOT NULL, ok INTEGER NOT NULL, status INTEGER NOT NULL DEFAULT 0,
+	error TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL, replica TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS judge_runs_judge ON judge_runs(replica, judge, at);
 `
 
 // migrations bring an existing database up to the current base schema.
@@ -115,4 +120,4 @@ var migrations = []struct{ table, column, ddl string }{
 
 // viewsVersion changes whenever viewsSchema or apply changes in a way that
 // needs existing projections rebuilt.
-const viewsVersion = "3"
+const viewsVersion = "4"

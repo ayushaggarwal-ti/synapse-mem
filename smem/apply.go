@@ -356,6 +356,14 @@ func apply(tx *sql.Tx, ev Event) error {
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				p.ID, p.Subject, a.at, p.Verdict.Label, p.Verdict.Confidence, p.DecidedBy, p.Action, p.Verdict.Reason, ev.Actor,
 				p.InputHash, len(p.Judges), ev.Replica, ev.ID)
+			for _, j := range p.Judges {
+				a.exec(`INSERT INTO judge_runs (judgment, judge, ok, status, error, at, replica) VALUES (?, ?, 1, 200, '', ?, ?)`,
+					p.ID, j.Judge, a.at, ev.Replica)
+			}
+			for _, je := range p.JudgeErrors {
+				a.exec(`INSERT INTO judge_runs (judgment, judge, ok, status, error, at, replica) VALUES (?, ?, 0, ?, ?, ?, ?)`,
+					p.ID, je.Judge, je.Status, je.Error, a.at, ev.Replica)
+			}
 		}
 
 	case evActionRecorded:

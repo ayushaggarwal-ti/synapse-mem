@@ -12,7 +12,12 @@ import (
 
 // CredentialEnv lists the environment variables smem reads credentials from.
 // Their values are always redacted, and they are never passed to checkers.
-var CredentialEnv = []string{"TYPESAFE_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
+var CredentialEnv = []string{"TYPESAFE_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_CUSTOM_HEADERS"}
+
+// judgeEnv is judge configuration that checkers don't get either, though
+// it isn't secret.
+var judgeEnv = []string{"ANTHROPIC_BASE_URL", "TYPESAFE_BASE_URL", "SMEM_JUDGE_MODEL"}
 
 // secretName matches environment variable names that hold secrets.
 var secretName = regexp.MustCompile(`(?i)(PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|_KEY$|^KEY$|PRIVATE_?KEY|CREDENTIAL|AUTH|_PAT$|COOKIE|SESSION_?ID|DSN|WEBHOOK)`)
@@ -127,6 +132,14 @@ func (r *Redactor) envSecrets() []string {
 			continue
 		}
 		vals = append(vals, v)
+		// A header line's value is the secret, and may appear on its own.
+		if name == "ANTHROPIC_CUSTOM_HEADERS" {
+			for _, h := range customHeaders(v) {
+				if len(h[1]) >= r.minLen {
+					vals = append(vals, h[1])
+				}
+			}
+		}
 	}
 	sort.Slice(vals, func(i, j int) bool { return len(vals[i]) > len(vals[j]) })
 	return vals
@@ -172,7 +185,7 @@ var checkerEnvBase = []string{"PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ", "T
 func checkerEnv(extra []string) []string {
 	var env []string
 	for _, name := range append(append([]string(nil), checkerEnvBase...), extra...) {
-		if contains(CredentialEnv, name) {
+		if contains(CredentialEnv, name) || contains(judgeEnv, name) {
 			continue
 		}
 		if v, ok := os.LookupEnv(name); ok {

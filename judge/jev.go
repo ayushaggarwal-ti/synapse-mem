@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -19,19 +18,21 @@ type Jev struct {
 	APIKey  string
 	Model   string
 	HTTP    *http.Client
+	Retry   Retry
+	Limit   Limiter
 	path    string
 }
 
 // NewJev returns a client for TypeSafe's API (TYPESAFE_API_KEY).
 func NewJev(apiKey string) *Jev {
 	return &Jev{BaseURL: "https://api.typesafe.ai", APIKey: apiKey, Model: "jev-latest",
-		HTTP: &http.Client{Timeout: 60 * time.Second}, path: "/v1/systemone"}
+		HTTP: &http.Client{Timeout: 60 * time.Second}, Limit: NewLimiter(2), path: "/v1/systemone"}
 }
 
 // NewJevOpenRouter returns a client for Jev through OpenRouter's Decisions API.
 func NewJevOpenRouter(apiKey string) *Jev {
 	return &Jev{BaseURL: "https://openrouter.ai/api", APIKey: apiKey, Model: "~typesafe/jev-latest",
-		HTTP: &http.Client{Timeout: 60 * time.Second}, path: "/alpha/decisions"}
+		HTTP: &http.Client{Timeout: 60 * time.Second}, Limit: NewLimiter(2), path: "/alpha/decisions"}
 }
 
 // Name implements Judge.
@@ -148,44 +149,37 @@ func confidenceOf(c *float64, probs map[string]float64, key string) float64 {
 	return probs[key]
 }
 
-// post sends with bounded retries on statuses that mean "not processed".
-// Response bodies never reach error messages: a reflecting endpoint could
-// echo the key.
+// post sends with retries (see Retry). Response bodies never reach error
+// messages: a reflecting endpoint could echo the key.
 func (j *Jev) post(ctx context.Context, body []byte) ([]byte, error) {
+	if err := j.Limit.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer j.Limit.release()
 	url := strings.TrimRight(j.BaseURL, "/") + j.path
-	for attempt := 1; ; attempt++ {
+	var data []byte
+	err := j.Retry.do(ctx, "jev", func() (int, string, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
-			return nil, err
+			return -1, "", err
 		}
 		req.Header.Set("Authorization", "Bearer "+j.APIKey)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
 		resp, err := j.HTTP.Do(req)
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, fmt.Errorf("jev: request failed")
+			return 0, "", err
 		}
-		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		b, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		retryable := resp.StatusCode == 408 || resp.StatusCode == 409 || resp.StatusCode == 429 || resp.StatusCode >= 500
-		if retryable && attempt < 3 {
-			delay := time.Duration(250*(1<<(attempt-1))+rand.IntN(100)) * time.Millisecond
-			select {
-			case <-time.After(delay):
-				continue
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("jev: HTTP %d", resp.StatusCode)
+			return resp.StatusCode, "", fmt.Errorf("status %d", resp.StatusCode)
 		}
 		if readErr != nil {
-			return nil, fmt.Errorf("jev: reading response failed")
+			return 0, "reading response", readErr
 		}
-		return data, nil
-	}
+		data = b
+		return resp.StatusCode, "", nil
+	})
+	return data, err
 }

@@ -248,7 +248,8 @@ type FactCheckResult struct {
 	Judgment  string     `json:"judgment"` // id of the recorded judgment
 	Trail     []judgeRun `json:"trail"`
 	Errors    []string   `json:"errors,omitempty"`
-	Cached    bool       `json:"cached,omitempty"` // an earlier judgment of the same input was reused
+	Cached    bool       `json:"cached,omitempty"`     // an earlier judgment of the same input was reused
+	NotJudged bool       `json:"not_judged,omitempty"` // judges were needed but every call failed
 }
 
 // judgeRun is one judge's contribution, as recorded in the log.
@@ -289,6 +290,14 @@ type judgmentRecorded struct {
 	Checkers  []checkerRun  `json:"checkers,omitempty"`
 	Judges    []judgeRun    `json:"judges,omitempty"`
 	Errors    []string      `json:"errors,omitempty"`
+	// JudgeErrors are judge calls that failed, with the HTTP status.
+	JudgeErrors []judgeError `json:"judge_errors,omitempty"`
+}
+
+type judgeError struct {
+	Judge  string `json:"judge"`
+	Status int    `json:"status,omitempty"`
+	Error  string `json:"error"`
 }
 
 var factQuestions = []judge.Question{
@@ -419,6 +428,12 @@ func (e *Engine) FactCheck(ctx context.Context, id string, apply bool) (*FactChe
 			}
 			if err != nil {
 				res.Errors = append(res.Errors, err.Error())
+				je := judgeError{Judge: st.Judge.Name(), Error: err.Error()}
+				var he *judge.HTTPError
+				if errors.As(err, &he) {
+					je.Status = he.Status
+				}
+				rec.JudgeErrors = append(rec.JudgeErrors, je)
 				continue
 			}
 			res.Trail = append(res.Trail, judgeRun{Judge: r.Judge, Model: r.Model, Calibrated: r.Calibrated,
@@ -464,6 +479,16 @@ func (e *Engine) FactCheck(ctx context.Context, id string, apply bool) (*FactChe
 		res.Action = "suspected"
 	case res.Settled && res.Verdict.Label == Supported:
 		res.Action = "review"
+	}
+	// Every judge failed and nothing else decided: say so, rather than
+	// looking like a check that found nothing.
+	if needJudges && len(res.Trail) == 0 && len(rec.JudgeErrors) > 0 && checkerVerdict == nil {
+		res.NotJudged, res.Action = true, "not-judged"
+		var msgs []string
+		for _, je := range rec.JudgeErrors {
+			msgs = append(msgs, je.Error)
+		}
+		res.Verdict.Reason = "not judged: " + strings.Join(msgs, "; ")
 	}
 	if !apply && (res.Action == "reconfirmed" || res.Action == "suspected") {
 		res.Action = map[string]string{"reconfirmed": "would-reconfirm", "suspected": "would-suspect"}[res.Action]
@@ -771,4 +796,31 @@ func globMatch(pattern, path string) bool {
 	b.WriteString("$")
 	re, err := regexp.Compile(b.String())
 	return err == nil && re.MatchString(path)
+}
+
+// JudgeHealth summarizes recent calls to one judge from this replica.
+type JudgeHealth struct {
+	Judge      string    `json:"judge"`
+	OK         int       `json:"ok"`
+	Failed     int       `json:"failed"`
+	LastStatus int       `json:"last_status,omitempty"`
+	LastError  string    `json:"last_error,omitempty"`
+	LastAt     time.Time `json:"last_at"`
+}
+
+// JudgeHealth reports judge calls from this replica over the last window,
+// so a judge that always fails is visible rather than looking like no judge.
+func (e *Engine) JudgeHealth(window time.Duration) ([]JudgeHealth, error) {
+	return selectAll(e.db, func(s scanner) (JudgeHealth, error) {
+		var h JudgeHealth
+		var at int64
+		err := s.Scan(&h.Judge, &h.OK, &h.Failed, &h.LastStatus, &h.LastError, &at)
+		h.LastAt = fromMs(at)
+		return h, err
+	}, `SELECT r.judge, SUM(r.ok), SUM(1 - r.ok),
+			COALESCE((SELECT status FROM judge_runs x WHERE x.judge = r.judge AND x.ok = 0 AND x.replica = ? ORDER BY at DESC LIMIT 1), 0),
+			COALESCE((SELECT error FROM judge_runs x WHERE x.judge = r.judge AND x.ok = 0 AND x.replica = ? ORDER BY at DESC LIMIT 1), ''),
+			MAX(r.at)
+		FROM judge_runs r WHERE r.replica = ? AND r.at > ? GROUP BY r.judge ORDER BY r.judge`,
+		e.replica, e.replica, e.replica, ms(e.Now().Add(-window)))
 }

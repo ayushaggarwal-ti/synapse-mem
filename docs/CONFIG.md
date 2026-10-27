@@ -141,9 +141,35 @@ the agent.
 ### `judges`
 
 ```json
-"judges": {"jev": {"disabled": false, "model": "jev-latest"},
-           "claude": {"when": "escalate", "model": "claude-haiku-5-5", "effort": "low", "max_tokens": 4096}}
+"judges": {"jev": {"disabled": false, "model": "jev-latest", "max_attempts": 4, "max_concurrent": 2},
+           "claude": {"when": "escalate", "model": "claude-haiku-5-5", "effort": "low", "max_tokens": 4096,
+                      "max_attempts": 4, "max_concurrent": 2}}
 ```
+
+Judges often share seats with other agents, so calls that weren't processed
+are retried gently: 408, 409, 429, 5xx and network errors, backing off 1s,
+2s, 4s and 8s with jitter, up to `max_attempts`. Other errors fail at once.
+At most `max_concurrent` calls per judge run at a time in a process. If
+every judge fails, the check is recorded as **not judged** with the HTTP
+status. That shows in `smem review`, `smem doctor` and `smem judges`, so it
+never looks the same as having no judge.
+
+**Through a gateway** with no Anthropic
+API key:
+
+```sh
+export ANTHROPIC_BASE_URL=https://gateway.example.com
+export ANTHROPIC_AUTH_TOKEN=…                         # or a key in the headers below
+export ANTHROPIC_CUSTOM_HEADERS='x-gateway-key: …'   # "Name: value" lines, as in Claude Code
+export SMEM_JUDGE_MODEL=my-gateway/claude-haiku-5-5
+```
+
+`SMEM_JUDGE_MODEL` overrides `judges.claude.model` for one agent. smem never
+reads Claude Code's own model variables (`ANTHROPIC_DEFAULT_*_MODEL`).
+Header values are treated as secrets: they are redacted, and checkers never
+see them. smem identifies itself as itself. A gateway that only serves
+requests presenting as Claude Code is fronting Claude Code seats, and smem
+won't work through it. Use a route backed by an API key.
 
 - **Jev** is enabled by `TYPESAFE_API_KEY`, or `OPENROUTER_API_KEY` to reach
   it through OpenRouter.

@@ -962,6 +962,13 @@ func (c *cli) review(args []string) error {
 	section("Conflicts: more than one live successor", rv.Conflicts, func(it smem.ReviewItem) {
 		c.printf("  %s → %s\n", it.ID, it.Summary)
 	})
+	if len(rv.Judges) > 0 {
+		c.printf("Judges failing (last 24h)\n")
+		for _, h := range rv.Judges {
+			c.printf("  %s: %d of %d call(s) failed; last: %s\n", h.Judge, h.Failed, h.OK+h.Failed, h.LastError)
+		}
+		c.printf("\n")
+	}
 	if len(rv.UntrustedKeys) > 0 {
 		c.printf("Untrusted keys (smem keys trust <key-id>)\n")
 		for _, k := range rv.UntrustedKeys {
@@ -969,7 +976,7 @@ func (c *cli) review(args []string) error {
 		}
 		c.printf("\n")
 	}
-	if len(rv.Suspect)+len(rv.AtRisk)+len(rv.Conflicts)+len(rv.UntrustedKeys) == 0 {
+	if len(rv.Suspect)+len(rv.AtRisk)+len(rv.Conflicts)+len(rv.UntrustedKeys)+len(rv.Judges) == 0 {
 		c.printf("nothing to review\n")
 	} else {
 		c.printf("Resolve with: reaffirm/revert <dec>, reconfirm/invalidate <mem>, supersede to pick a version.\n")
@@ -1291,7 +1298,7 @@ func (c *cli) judges(args []string) error {
 	}
 	names := c.e.Judges.Names()
 	if len(names) == 0 {
-		c.printf("judges: none (TYPESAFE_API_KEY or OPENROUTER_API_KEY for Jev; ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN for Claude)\n")
+		c.printf("judges: none (TYPESAFE_API_KEY or OPENROUTER_API_KEY for Jev; ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or ANTHROPIC_BASE_URL with ANTHROPIC_CUSTOM_HEADERS for Claude)\n")
 	} else {
 		c.printf("judges, in order: %s\n", strings.Join(names, " → "))
 	}
@@ -1302,6 +1309,15 @@ func (c *cli) judges(args []string) error {
 	}
 	for _, k := range c.e.Checkers {
 		c.printf("checker: %s\n", k.Name())
+	}
+	if health, err := c.e.JudgeHealth(24 * time.Hour); err == nil {
+		for _, h := range health {
+			c.printf("%s, last 24h: %d ok, %d failed", h.Judge, h.OK, h.Failed)
+			if h.Failed > 0 {
+				c.printf("; last failure: %s", h.LastError)
+			}
+			c.printf("\n")
+		}
 	}
 	if *ping {
 		for _, r := range smem.PingJudges(context.Background(), c.e.Judges) {

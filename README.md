@@ -214,4 +214,6 @@ the API keys. Details and limits: DESIGN.md §7.
 | `SMEM_SESSION` | Session id |
 | `SMEM_KEY_DIR` | Private keys (default: user config dir `smem/keys`) |
 | `TYPESAFE_API_KEY` / `OPENROUTER_API_KEY` | Enables the Jev judge |
-| `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | Enables the Claude judge (`ANTHROPIC_BASE_URL` for a gateway) |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | Enables the Claude judge |
+| `ANTHROPIC_BASE_URL` + `ANTHROPIC_CUSTOM_HEADERS` | Claude judge through a gateway (headers are `Name: value` lines) |
+| `SMEM_JUDGE_MODEL` | Claude judge model for this agent, e.g. a gateway-prefixed id |
