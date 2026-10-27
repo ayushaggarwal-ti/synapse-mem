@@ -53,6 +53,9 @@ const suspectQuery = `
 	UNION ALL
 	SELECT x.id, 'memory', x.status, x.content, COALESCE(s.cause, ''), COALESCE(s.reason, ''), '', COALESCE(s.at, 0)
 		FROM memories x ` + latestSuspicion + ` WHERE x.status = 'suspect'
+	UNION ALL
+	SELECT x.id, 'rule', x.status, x.text, COALESCE(s.cause, ''), COALESCE(s.reason, ''), '', COALESCE(s.at, 0)
+		FROM rules x ` + latestSuspicion + ` WHERE x.status = 'suspect'
 	ORDER BY 8 DESC`
 
 const atRiskQuery = `

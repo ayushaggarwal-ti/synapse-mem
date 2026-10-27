@@ -69,6 +69,19 @@ Keys and sync
   export [--replica id]    events as JSON lines on stdout
   import <file|->          verify and merge events
 
+Rules (admitted only with a reason; see docs/CONFIG.md "rules")
+  failure <label> <summary> record a failure   --ref
+  failures                 --label --limit
+  rules [list]             --status proposed|active|suspect|retired|rejected (default active) --json
+  rules propose <text>     --why requested|incident|decision --by --quote --transcript --decision
+                           --label --failures fail,... --enforced-by --scope
+  rules approve <rule>     a person admits a held proposal   --by --note
+  rules reject|retire|reaffirm|violated <rule>...   --reason
+  rules merge <rule> <rule>... --text   replace several rules with one
+  rules rationalize        duplicates, held, promotable, ineffective, violated, stale, over cap
+                           --import file,... (CLAUDE.md, .claude/rules/*.md) --judges --json
+  rules render             write active rules into a managed block   --file (default rules.file) --check
+
 Fact-checking
   factcheck [mem...]       user checkers first, then judges (Jev, then Claude if unsure)
                            --due --threshold --limit --parallel --dry-run --json
@@ -297,7 +310,8 @@ var commands = map[string]func(*cli, []string) error{
 	"sync": (*cli).sync, "push": (*cli).push, "pull": (*cli).pull, "export": (*cli).export,
 	"import": (*cli).importCmd, "hook": nil,
 	"factcheck": (*cli).factcheck, "judges": (*cli).judges, "mcp": (*cli).mcp,
-	"doctor": (*cli).doctor, "stats": (*cli).stats,
+	"doctor": (*cli).doctor, "stats": (*cli).stats, "failure": (*cli).failure, "failures": (*cli).failuresCmd,
+	"rules": (*cli).rules,
 }
 
 // parse parses flags that may appear before, between or after positional args.
@@ -1409,4 +1423,273 @@ func (c *cli) stats(args []string) error {
 		c.printf("spool       %d tool call(s) waiting\n", s.Spool)
 	}
 	return nil
+}
+
+func (c *cli) failure(args []string) error {
+	fs := flag.NewFlagSet("failure", flag.ContinueOnError)
+	ref := fs.String("ref", "", "test path, commit, bead or URL")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if err := need(pos, 2, `smem failure <label> "<what went wrong>" [--ref]`); err != nil {
+		return err
+	}
+	id, promoted, err := c.e.RecordFailure(smem.FailureInput{Label: pos[0], Summary: strings.Join(pos[1:], " "), Ref: *ref})
+	if err != nil {
+		return err
+	}
+	c.printf("%s\n", id)
+	for _, r := range promoted {
+		c.printf("  admitted %s: enough %q failures now\n", r, pos[0])
+	}
+	return nil
+}
+
+func (c *cli) failuresCmd(args []string) error {
+	fs := flag.NewFlagSet("failures", flag.ContinueOnError)
+	label := fs.String("label", "", "only this label")
+	limit := fs.Int("limit", 50, "max")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	fsl, err := c.e.Failures(*label, *limit)
+	if err != nil {
+		return err
+	}
+	for _, f := range fsl {
+		c.printf("%s  %s  %-20s %s\n", f.ID, f.At.Local().Format("2006-01-02 15:04"), f.Label, oneLine(f.Summary, 90))
+	}
+	return nil
+}
+
+func (c *cli) rules(args []string) error {
+	sub := "list"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		sub, args = args[0], args[1:]
+	}
+	outcome := func(o *smem.RuleOutcome, err error) error {
+		if err != nil {
+			return err
+		}
+		if o.Admitted {
+			c.printf("%s admitted: %s\n", o.ID, o.Reason)
+		} else {
+			c.printf("%s held (proposed, not active): %s\n", o.ID, o.Reason)
+		}
+		for _, r := range o.Retired {
+			c.printf("  retired %s\n", r)
+		}
+		return nil
+	}
+	switch sub {
+	case "list":
+		fs := flag.NewFlagSet("rules", flag.ContinueOnError)
+		status := fs.String("status", "active", "proposed, active, suspect, retired, rejected, or all")
+		asJSON := fs.Bool("json", false, "JSON output")
+		if _, err := parse(fs, args); err != nil {
+			return err
+		}
+		st := *status
+		if st == "all" {
+			st = ""
+		}
+		rs, err := c.e.Rules(st)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return c.json(rs)
+		}
+		if len(rs) == 0 {
+			c.printf("no %s rules\n", *status)
+		}
+		for _, r := range rs {
+			why := r.Basis
+			if r.Status == "proposed" {
+				why = "held: " + r.Held
+			}
+			c.printf("%s [%s] %s\n    %s\n", r.ID, r.Status, oneLine(r.Text, 110), oneLine(why, 120))
+		}
+		return nil
+	case "propose":
+		fs := flag.NewFlagSet("rules propose", flag.ContinueOnError)
+		var in smem.RuleInput
+		var failures list
+		fs.StringVar(&in.Why.Kind, "why", "", "requested, incident or decision")
+		fs.StringVar(&in.Why.By, "by", "", "who asked for it")
+		fs.StringVar(&in.Why.Quote, "quote", "", "their words")
+		fs.StringVar(&in.Why.Transcript, "transcript", "", "where they said it")
+		fs.StringVar(&in.Why.Decision, "decision", "", "the decision it carries out")
+		fs.StringVar(&in.Why.EnforcedBy, "enforced-by", "", "the test or check that enforces it, e.g. test:./ci/lint_test.go")
+		fs.StringVar(&in.Label, "label", "", "the failure label it addresses")
+		fs.Var(&failures, "failures", "fail- ids it answers")
+		fs.StringVar(&in.Scope, "scope", "", "scope (default scopes.write)")
+		pos, err := parse(fs, args)
+		if err != nil {
+			return err
+		}
+		if err := need(pos, 1, `smem rules propose "<rule>" --why ...`); err != nil {
+			return err
+		}
+		in.Text, in.Why.Failures = strings.Join(pos, " "), failures
+		return outcome(c.e.ProposeRule(in))
+	case "approve":
+		fs := flag.NewFlagSet("rules approve", flag.ContinueOnError)
+		by := fs.String("by", "", "who approves")
+		note := fs.String("note", "", "why")
+		pos, err := parse(fs, args)
+		if err != nil {
+			return err
+		}
+		if err := need(pos, 1, "smem rules approve <rule> --by <who>"); err != nil {
+			return err
+		}
+		for _, id := range pos {
+			if err := outcome(c.e.ApproveRule(id, *by, *note)); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "reject", "retire", "reaffirm", "violated":
+		fs := flag.NewFlagSet("rules "+sub, flag.ContinueOnError)
+		reason := fs.String("reason", "", "why")
+		pos, err := parse(fs, args)
+		if err != nil {
+			return err
+		}
+		if err := need(pos, 1, "smem rules "+sub+" <rule>... --reason"); err != nil {
+			return err
+		}
+		fn := map[string]func(string, string) error{"reject": c.e.RejectRule, "retire": c.e.RetireRule,
+			"reaffirm": c.e.ReaffirmRule, "violated": c.e.RuleViolated}[sub]
+		for _, id := range pos {
+			if err := fn(id, *reason); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "merge":
+		fs := flag.NewFlagSet("rules merge", flag.ContinueOnError)
+		text := fs.String("text", "", "the merged rule")
+		pos, err := parse(fs, args)
+		if err != nil {
+			return err
+		}
+		if *text == "" || len(pos) < 2 {
+			return errors.New(`usage: smem rules merge <rule> <rule>... --text "<merged rule>"`)
+		}
+		return outcome(c.e.MergeRules(pos, *text, smem.Justification{}))
+	case "rationalize":
+		fs := flag.NewFlagSet("rules rationalize", flag.ContinueOnError)
+		var imports list
+		fs.Var(&imports, "import", "files to import rules from, e.g. CLAUDE.md,.claude/rules/testing.md")
+		judges := fs.Bool("judges", false, "ask judges about rule pairs that might mean the same thing")
+		asJSON := fs.Bool("json", false, "JSON output")
+		if _, err := parse(fs, args); err != nil {
+			return err
+		}
+		if len(imports) > 0 {
+			ids, err := c.e.ImportRules(imports)
+			if err != nil {
+				return err
+			}
+			c.printf("imported %d rule(s) as proposals\n\n", len(ids))
+		}
+		rep, err := c.e.RationalizeRules(context.Background(), *judges)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return c.json(rep)
+		}
+		c.rulesReport(rep)
+		return nil
+	case "render":
+		fs := flag.NewFlagSet("rules render", flag.ContinueOnError)
+		file := fs.String("file", "", "file to write (default rules.file, CLAUDE.md)")
+		check := fs.Bool("check", false, "change nothing; fail if the file is out of date")
+		if _, err := parse(fs, args); err != nil {
+			return err
+		}
+		changed, err := c.e.RenderRules(*file, *check)
+		if err != nil {
+			return err
+		}
+		switch {
+		case *check && changed:
+			return errors.New("rules block is out of date; run smem rules render")
+		case changed:
+			c.printf("updated %s\n", cmp.Or(*file, c.e.Policy.Rules.File))
+		default:
+			c.printf("up to date\n")
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown rules command %q (see smem help)", sub)
+}
+
+func (c *cli) rulesReport(rep *smem.RulesReport) {
+	section := func(title string, n int, fn func()) {
+		if n == 0 {
+			return
+		}
+		c.printf("%s (%d)\n", title, n)
+		fn()
+		c.printf("\n")
+	}
+	section("Duplicates: merge or retire one", len(rep.Duplicates), func() {
+		for _, p := range rep.Duplicates {
+			how := fmt.Sprintf("word overlap %.2f", p.Similarity)
+			if p.JudgedBy != "" {
+				how = "same meaning per " + p.JudgedBy
+			}
+			c.printf("  %s ~ %s (%s)\n    %s\n    %s\n", p.A.ID, p.B.ID, how, oneLine(p.A.Text, 100), oneLine(p.B.Text, 100))
+		}
+	})
+	section("Promotable: held proposals whose reason now holds", len(rep.Promotable), func() {
+		for _, r := range rep.Promotable {
+			c.printf("  %s %s\n", r.ID, oneLine(r.Text, 110))
+		}
+	})
+	section("Held: no reason that holds up (approve, reject, or wait for failures)", len(rep.Held), func() {
+		for _, r := range rep.Held {
+			src := ""
+			if r.Source != "" {
+				src = " (" + r.Source + ")"
+			}
+			c.printf("  %s %s%s\n    %s\n", r.ID, oneLine(r.Text, 100), src, oneLine(r.Held, 120))
+		}
+	})
+	section("Suspect: what they rest on changed (reaffirm or retire)", len(rep.Suspect), func() {
+		for _, r := range rep.Suspect {
+			c.printf("  %s %s\n", r.ID, oneLine(r.Text, 110))
+		}
+	})
+	section("Ineffective: failures they were meant to prevent happened since", len(rep.Ineffective), func() {
+		for _, rc := range rep.Ineffective {
+			c.printf("  %s %d × %q: %s\n", rc.Rule.ID, rc.Count, rc.Rule.Label, oneLine(rc.Rule.Text, 90))
+		}
+	})
+	section("Violated", len(rep.Violated), func() {
+		for _, rc := range rep.Violated {
+			c.printf("  %s %d time(s): %s\n", rc.Rule.ID, rc.Count, oneLine(rc.Rule.Text, 90))
+		}
+	})
+	section("Stale: no activity for rules.stale_after", len(rep.Stale), func() {
+		for _, r := range rep.Stale {
+			c.printf("  %s last active %s: %s\n", r.ID, r.LastActivity.Local().Format("2006-01-02"), oneLine(r.Text, 90))
+		}
+	})
+	section("Over the cap", len(rep.OverCap), func() {
+		for _, s := range rep.OverCap {
+			c.printf("  %s\n", s)
+		}
+	})
+	for _, n := range rep.Notes {
+		c.printf("note: %s\n", n)
+	}
+	if len(rep.Duplicates)+len(rep.Promotable)+len(rep.Held)+len(rep.Suspect)+len(rep.Ineffective)+len(rep.Violated)+len(rep.Stale)+len(rep.OverCap) == 0 {
+		c.printf("rules look healthy\n")
+	}
 }

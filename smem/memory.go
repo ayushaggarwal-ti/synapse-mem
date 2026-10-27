@@ -93,7 +93,7 @@ type Flag struct {
 func flagsFrom(evs []Event) []Flag {
 	var out []Flag
 	for _, ev := range evs {
-		if ev.Type != evDecisionSuspected && ev.Type != evMemorySuspected {
+		if ev.Type != evDecisionSuspected && ev.Type != evMemorySuspected && ev.Type != evRuleSuspected {
 			continue
 		}
 		var p statusChange
@@ -250,7 +250,13 @@ func (e *Engine) Signal(id, signal, note string) error {
 		if err := w.require(id, "mem"); err != nil {
 			return err
 		}
-		_, err := w.emit(evMemorySignal, id, memorySignal{ID: id, Signal: signal, Note: note})
+		p := memorySignal{ID: id, Signal: signal, Note: note}
+		if signal == "confirmed" {
+			// The boost goes in the event, so every replica projects the
+			// same confidence whatever its own config says.
+			p.Boost = w.e.Policy.Confidence.ConfirmBoost
+		}
+		_, err := w.emit(evMemorySignal, id, p)
 		return err
 	})
 	return err
@@ -274,8 +280,11 @@ func (w *wtx) propagate(root, reason string) error {
 			}
 			for _, d := range deps {
 				typ := evDecisionSuspected
-				if strings.HasPrefix(d, "mem-") {
+				switch {
+				case strings.HasPrefix(d, "mem-"):
 					typ = evMemorySuspected
+				case strings.HasPrefix(d, "rule-"):
+					typ = evRuleSuspected
 				}
 				if _, err := w.emit(typ, d, statusChange{ID: d, Cause: cause, Root: root, Reason: reason}); err != nil {
 					return err
@@ -300,7 +309,10 @@ func (w *wtx) dependents(id string) ([]string, error) {
 		UNION
 		SELECT m.id FROM edges e JOIN memories m ON m.id = e.src
 			WHERE e.dst = ? AND e.type = 'derived_from' AND m.status = 'active'
-		ORDER BY 1`, id, id, id)
+		UNION
+		SELECT r.id FROM edges e JOIN rules r ON r.id = e.src
+			WHERE e.dst = ? AND e.type = 'justified_by' AND r.status = 'active'
+		ORDER BY 1`, id, id, id, id)
 	if err != nil {
 		return nil, err
 	}

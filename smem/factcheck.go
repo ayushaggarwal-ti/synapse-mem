@@ -480,15 +480,31 @@ func (e *Engine) FactCheck(ctx context.Context, id string, apply bool) (*FactChe
 	case res.Settled && res.Verdict.Label == Supported:
 		res.Action = "review"
 	}
-	// Every judge failed and nothing else decided: say so, rather than
-	// looking like a check that found nothing.
-	if needJudges && len(res.Trail) == 0 && len(rec.JudgeErrors) > 0 && checkerVerdict == nil {
-		res.NotJudged, res.Action = true, "not-judged"
-		var msgs []string
-		for _, je := range rec.JudgeErrors {
-			msgs = append(msgs, je.Error)
+	// Nothing decided and no judge answered: say why, rather than looking
+	// like a check that found nothing.
+	if checkerVerdict == nil && len(res.Trail) == 0 {
+		var why string
+		switch {
+		case len(rec.JudgeErrors) > 0:
+			var msgs []string
+			for _, je := range rec.JudgeErrors {
+				msgs = append(msgs, je.Error)
+			}
+			why = strings.Join(msgs, "; ")
+		case len(e.Judges.Stages) == 0:
+			why = "no judge configured (TYPESAFE_API_KEY for Jev; ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or a gateway for Claude; see smem doctor)"
+			if len(e.Checkers) > 0 {
+				why += ", and no checker gave a verdict"
+			}
+		case len(claim.Evidence) == 0:
+			why = "no evidence to check against: link sources with derived_from, or add related memories"
+		case len(res.Errors) > 0:
+			why = res.Errors[len(res.Errors)-1] // e.g. the daily budget
 		}
-		res.Verdict.Reason = "not judged: " + strings.Join(msgs, "; ")
+		if why != "" {
+			res.NotJudged, res.Action = true, "not-judged"
+			res.Verdict.Reason = "not judged: " + why
+		}
 	}
 	if !apply && (res.Action == "reconfirmed" || res.Action == "suspected") {
 		res.Action = map[string]string{"reconfirmed": "would-reconfirm", "suspected": "would-suspect"}[res.Action]

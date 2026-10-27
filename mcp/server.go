@@ -33,7 +33,9 @@ const instructions = `smem is your long-term memory and decision log for this pr
 - Learned something durable (a fact about the system, a user preference, a procedure that worked): memory_remember it. Not transient chatter.
 - A remembered fact turned out wrong: memory_update it if it changed, memory_invalidate it if it no longer holds.
 - Made a non-obvious choice: decision_record it with the options you rejected, your assumptions, and the memory ids you relied on. Report how it went with decision_outcome.
-- Asked why something is the way it is: why.`
+- Asked why something is the way it is: why.
+- Something failed (test, build, a correction from a person): failure_record it with a consistent label.
+- Want a standing rule? rule_propose it with its reason. Never write rules into CLAUDE.md yourself.`
 
 // Server serves one store.
 type Server struct {

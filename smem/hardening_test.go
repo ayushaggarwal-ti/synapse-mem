@@ -580,3 +580,33 @@ func TestClaudeThroughGatewayHeaders(t *testing.T) {
 		}
 	}
 }
+
+func TestConfirmationRaisesConfidence(t *testing.T) {
+	c := start()
+	e := newEngine(t, "alice", c)
+	m := remember(t, e, "fact", "the cache ttl is 60s")
+	conf := func() float64 {
+		return must[[]Scored](t)(e.Recall(RecallQuery{Text: "cache ttl", NoRecord: true}))[0].Confidence
+	}
+	if got := conf(); got < 0.79 || got > 0.81 {
+		t.Fatalf("starts at 0.80: %.3f", got)
+	}
+	ok(t, e.Signal(m, "confirmed", "checked the config"))
+	if got := conf(); got < 0.89 || got > 0.91 {
+		t.Fatalf("one confirmation halves the doubt: %.3f", got)
+	}
+	ok(t, e.Signal(m, "confirmed", "checked again"))
+	if got := conf(); got < 0.94 {
+		t.Fatalf("two: %.3f", got)
+	}
+	if ctx := must[string](t)(e.Context(0)); !strings.Contains(ctx, "conf 0.95") {
+		t.Fatalf("the context view shows it:\n%s", ctx)
+	}
+	// The boost is in the event: a replica with another setting projects the same.
+	e.Policy.Confidence.ConfirmBoost = 0
+	before := dumpViews(t, e)
+	ok(t, e.Rebuild())
+	if dumpViews(t, e) != before {
+		t.Fatal("replay must not depend on local config")
+	}
+}

@@ -51,15 +51,24 @@ var localOnly = []string{"actor", "checkers", "endpoints", "keys", "trust"}
 
 // Policy is the behavior that a project config may set.
 type Policy struct {
-	Beads     BeadsPolicy     `json:"beads"`
-	Scopes    ScopesPolicy    `json:"scopes"`
-	Context   ContextPolicy   `json:"context"`
-	Decay     DecayPolicy     `json:"decay"`
-	Recall    RecallPolicy    `json:"recall"`
-	Sync      SyncPolicy      `json:"sync"`
-	Hooks     HooksPolicy     `json:"hooks"`
-	Redaction RedactionPolicy `json:"redaction"`
-	MCP       MCPPolicy       `json:"mcp"`
+	Beads      BeadsPolicy      `json:"beads"`
+	Scopes     ScopesPolicy     `json:"scopes"`
+	Context    ContextPolicy    `json:"context"`
+	Decay      DecayPolicy      `json:"decay"`
+	Recall     RecallPolicy     `json:"recall"`
+	Sync       SyncPolicy       `json:"sync"`
+	Hooks      HooksPolicy      `json:"hooks"`
+	Redaction  RedactionPolicy  `json:"redaction"`
+	MCP        MCPPolicy        `json:"mcp"`
+	Rules      RulesPolicy      `json:"rules"`
+	Confidence ConfidencePolicy `json:"confidence"`
+}
+
+// ConfidencePolicy tunes how evidence changes a memory's confidence.
+type ConfidencePolicy struct {
+	// ConfirmBoost is the share of remaining doubt one confirmation
+	// removes: 0.5 takes 0.8 to 0.9, then 0.95. 0 only resets the clock.
+	ConfirmBoost float64 `json:"confirm_boost"`
 }
 
 // BeadsPolicy says which references are bead (issue) ids.
@@ -256,13 +265,15 @@ func parseDuration(s string) (time.Duration, error) {
 // DefaultPolicy is the behavior with no config.
 func DefaultPolicy() Policy {
 	return Policy{
-		Beads:     BeadsPolicy{Prefixes: []string{"bd"}, Detect: true},
-		Context:   ContextPolicy{Budget: 4000, On: []string{"startup", "clear"}},
-		Decay:     DecayPolicy{Clock: "active", IdleAfter: Duration(24 * time.Hour)},
-		Recall:    RecallPolicy{DedupeWindow: Duration(10 * time.Minute)},
-		Sync:      SyncPolicy{MaxFutureSkew: Duration(5 * time.Minute), MaxBackdate: Duration(30 * 24 * time.Hour)},
-		Hooks:     HooksPolicy{Spool: true, LockTimeout: Duration(2 * time.Second), LinkDecisions: "unambiguous", LinkWindow: Duration(30 * time.Minute)},
-		Redaction: RedactionPolicy{MinEnvValue: 6},
+		Beads:      BeadsPolicy{Prefixes: []string{"bd"}, Detect: true},
+		Context:    ContextPolicy{Budget: 4000, On: []string{"startup", "clear"}},
+		Decay:      DecayPolicy{Clock: "active", IdleAfter: Duration(24 * time.Hour)},
+		Recall:     RecallPolicy{DedupeWindow: Duration(10 * time.Minute)},
+		Sync:       SyncPolicy{MaxFutureSkew: Duration(5 * time.Minute), MaxBackdate: Duration(30 * 24 * time.Hour)},
+		Hooks:      HooksPolicy{Spool: true, LockTimeout: Duration(2 * time.Second), LinkDecisions: "unambiguous", LinkWindow: Duration(30 * time.Minute)},
+		Redaction:  RedactionPolicy{MinEnvValue: 6},
+		Rules:      DefaultRulesPolicy(),
+		Confidence: ConfidencePolicy{ConfirmBoost: 0.5},
 	}
 }
 

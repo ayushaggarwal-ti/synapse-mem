@@ -1,6 +1,6 @@
 {
   "name": "smem",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Long-term memory and a decision log: recall and remember over MCP, session-start context, and tool calls recorded in a signed, verifiable log.",
   "author": { "name": "rahulsub" },
   "repository": "https://github.com/rahulsub/synapse-mem",

@@ -72,6 +72,49 @@ memory. `wall` counts real time. Confidence ("is it still true?") always
 uses real time, because the world changes whether or not the agent is
 running.
 
+### `confidence`
+
+```json
+"confidence": {"confirm_boost": 0.5}
+```
+
+The share of remaining doubt removed by each `confirmed` signal: 0.8 goes to
+0.9, then 0.95. 0 means a confirmation only resets the age of the evidence.
+The value used is written into the event, so replicas with different
+settings still agree.
+
+### `rules`: governance of agent rules
+
+```json
+"rules": {"min_failures": 2, "failure_window": "30d", "require_enforcement": false, "require_quote": true,
+          "max_active": 30, "duplicate_at": 0.6, "stale_after": "90d", "auto_promote": true,
+          "file": "CLAUDE.md", "in_context": false}
+```
+
+A rule is only **active** (rendered and injected) with a reason that holds
+up. Anything else is a held proposal.
+- **requested:** a person asked. Needs `by`, and the person's words
+  (`quote`) when `require_quote` is set.
+- **incident:** at least `min_failures` failures with the rule's label
+  within `failure_window`. Also needs `enforced_by` (the test or check that
+  catches it) when `require_enforcement` is set.
+- **decision:** it carries out an active decision. If the decision is
+  reverted or becomes suspect, the rule is flagged suspect.
+- **approved:** a person approved a held proposal (`smem rules approve
+  --by`).
+
+The other settings:
+- `duplicate_at`: the word-overlap similarity at which a new rule counts as
+  a duplicate of an active one in its scope, and is held.
+  `smem rules rationalize --judges` also asks the judges about paraphrases.
+- `max_active`: caps active rules per scope.
+- `auto_promote`: admits a held proposal as soon as enough failures share
+  its label.
+- `stale_after`: flags active rules with no activity for that long.
+- `file`: where `smem rules render` writes its managed block.
+- `in_context`: also lists active rules in the session-start context, for
+  agents that don't read `CLAUDE.md`.
+
 ### `recall`
 
 ```json

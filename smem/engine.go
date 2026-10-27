@@ -144,7 +144,7 @@ func (e *Engine) setup() error {
 			}
 		}
 	}
-	if _, err := e.db.Exec(viewsSchema); err != nil {
+	if _, err := e.db.Exec(viewsSchema + rulesSchema); err != nil {
 		return fmt.Errorf("schema: %w", err)
 	}
 	// Two processes opening a new store at once must agree on one id, so
@@ -409,8 +409,12 @@ func (w *wtx) lookup(id string) (kind, status string, err error) {
 		q = `SELECT '' FROM sources WHERE id = ?`
 	case "act":
 		q = `SELECT '' FROM actions WHERE id = ?`
+	case "rule":
+		q = `SELECT status FROM rules WHERE id = ?`
+	case "fail":
+		q = `SELECT '' FROM failures WHERE id = ?`
 	default:
-		return "", "", fmt.Errorf("%q is not a memory, decision, assumption, source or action id", id)
+		return "", "", fmt.Errorf("%q is not a memory, decision, assumption, source, action, rule or failure id", id)
 	}
 	err = w.tx.QueryRow(q, id).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -438,7 +442,8 @@ func (w *wtx) require(id, kind string, statuses ...string) error {
 	return fmt.Errorf("%s is %s (expected %s)", id, st, strings.Join(statuses, " or "))
 }
 
-var kindName = map[string]string{"mem": "memory", "dec": "decision", "asm": "assumption", "src": "source", "act": "action"}
+var kindName = map[string]string{"mem": "memory", "dec": "decision", "asm": "assumption", "src": "source", "act": "action",
+	"rule": "rule", "fail": "failure"}
 
 func isRecordID(s string) bool {
 	k, rest, ok := strings.Cut(s, "-")

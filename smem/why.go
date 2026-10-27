@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -98,7 +99,19 @@ type Trace struct {
 	Source     *Source         `json:"source,omitempty"`
 	Actions    []Action        `json:"actions,omitempty"`
 	Derived    []Link          `json:"derived,omitempty"`
+	Rule       *RuleTrace      `json:"rule,omitempty"`
+	Failure    *Failure        `json:"failure,omitempty"`
 	Notes      []string        `json:"notes,omitempty"`
+}
+
+// RuleTrace is why a rule exists and how it has fared.
+type RuleTrace struct {
+	Rule     Rule          `json:"rule"`
+	Failures []Failure     `json:"failures"` // with its label, before admission
+	Since    []Failure     `json:"since"`    // with its label, after admission: it didn't prevent these
+	Replaces []Link        `json:"replaces"`
+	Rules    []Link        `json:"rules"` // rules this failure helped justify (failure traces)
+	History  []StatusEntry `json:"history"`
 }
 
 var decisionTrailer = regexp.MustCompile(`(?im)^Decision:\s*(dec-[0-9a-f]+)\s*$`)
@@ -137,6 +150,18 @@ func (e *Engine) Why(ref string) (*Trace, error) {
 		if t.Actions, err = e.actions(`id = ?`, ref); err == nil && len(t.Actions) > 0 && t.Actions[0].DecisionID != "" {
 			err = e.addDecisions(t, t.Actions[0].DecisionID)
 		}
+	case kind == "rule" && isRecordID(ref):
+		t.Kind = "rule"
+		if t.Rule, err = e.ruleTrace(ref); err == nil && t.Rule.Rule.Why.Decision != "" {
+			err = e.addDecisions(t, t.Rule.Rule.Why.Decision)
+		}
+	case kind == "fail" && isRecordID(ref):
+		t.Kind = "failure"
+		var fs []Failure
+		if fs, err = e.failures(`id = ?`, ref); err == nil && len(fs) == 1 {
+			t.Failure = &fs[0]
+			t.Derived, err = e.links(`SELECT id, 'rule' FROM rules WHERE label = ? AND label != '' ORDER BY proposed_at`, fs[0].Label)
+		}
 	case hexRef.MatchString(ref):
 		t.Kind = "commit"
 		err = e.commitTrace(t, ref)
@@ -155,7 +180,8 @@ func (e *Engine) Why(ref string) (*Trace, error) {
 	if err != nil {
 		return nil, err
 	}
-	if t.Memory == nil && t.Source == nil && t.Assumption == nil && len(t.Decisions) == 0 && len(t.Actions) == 0 {
+	if t.Memory == nil && t.Source == nil && t.Assumption == nil && t.Rule == nil && t.Failure == nil &&
+		len(t.Decisions) == 0 && len(t.Actions) == 0 {
 		return nil, fmt.Errorf("nothing recorded for %s", ref)
 	}
 	return t, nil
@@ -340,6 +366,10 @@ func (e *Engine) label(id string) string {
 		e.db.QueryRow(`SELECT '[' || status || '] ' || question || ' → ' || choice FROM decisions WHERE id = ?`, id).Scan(&s)
 	case "src":
 		e.db.QueryRow(`SELECT kind || ': ' || ref FROM sources WHERE id = ?`, id).Scan(&s)
+	case "rule":
+		e.db.QueryRow(`SELECT '[' || status || '] ' || text FROM rules WHERE id = ?`, id).Scan(&s)
+	case "fail":
+		e.db.QueryRow(`SELECT '[' || label || '] ' || summary FROM failures WHERE id = ?`, id).Scan(&s)
 	}
 	return oneLine(s, 120)
 }
@@ -374,6 +404,59 @@ func (t *Trace) Text() string {
 	var b strings.Builder
 	p := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
 	when := func(x time.Time) string { return x.Local().Format("2006-01-02 15:04") }
+	if r := t.Rule; r != nil {
+		p("rule %s [%s]%s\n  %s\n", r.Rule.ID, r.Rule.Status, map[bool]string{true: " scope " + r.Rule.Scope}[r.Rule.Scope != ""], r.Rule.Text)
+		w := r.Rule.Why
+		p("  proposed %s by %s", when(r.Rule.ProposedAt), r.Rule.Actor)
+		if r.Rule.Source != "" {
+			p(" from %s", r.Rule.Source)
+		}
+		p("\n  reason given: %s", cmp(w.Kind, "none"))
+		if w.By != "" {
+			p(" by %s", w.By)
+		}
+		if w.Quote != "" {
+			p(": %q", w.Quote)
+		}
+		if w.Transcript != "" {
+			p(" (%s)", w.Transcript)
+		}
+		if w.EnforcedBy != "" {
+			p("; enforced by %s", w.EnforcedBy)
+		}
+		p("\n")
+		if r.Rule.Basis != "" {
+			p("  admitted: %s\n", r.Rule.Basis)
+		}
+		if r.Rule.Held != "" {
+			p("  held: %s\n", r.Rule.Held)
+		}
+		for _, f := range r.Failures {
+			p("  failure %s %s [%s] %s\n", f.ID, when(f.At), f.Label, oneLine(f.Summary, 100))
+		}
+		if len(r.Since) > 0 {
+			p("  %d %q failure(s) since it was admitted:\n", len(r.Since), r.Rule.Label)
+			for _, f := range r.Since {
+				p("    %s %s %s\n", f.ID, when(f.At), oneLine(f.Summary, 100))
+			}
+		}
+		if r.Rule.Violations > 0 {
+			p("  violated %d time(s)\n", r.Rule.Violations)
+		}
+		for _, l := range r.Replaces {
+			p("  replaces %s: %s\n", l.ID, l.Label)
+		}
+		writeHistory(&b, r.History)
+	}
+	if f := t.Failure; f != nil {
+		p("failure %s [%s] %s by %s\n  %s\n", f.ID, f.Label, when(f.At), f.Actor, f.Summary)
+		if f.Ref != "" {
+			p("  ref: %s\n", f.Ref)
+		}
+		for _, l := range t.Derived {
+			p("  label shared by rule %s: %s\n", l.ID, l.Label)
+		}
+	}
 	for _, n := range t.Notes {
 		p("note: %s\n", n)
 	}
@@ -521,4 +604,46 @@ func writeHistory(b *strings.Builder, h []StatusEntry) {
 		}
 		fmt.Fprintf(b, " (%s)\n", s.Actor)
 	}
+}
+
+func (e *Engine) failures(where string, args ...any) ([]Failure, error) {
+	return selectAll(e.db, func(s scanner) (Failure, error) {
+		var f Failure
+		var at int64
+		err := s.Scan(&f.ID, &f.Label, &f.Summary, &f.Ref, &at, &f.Actor, &f.Session)
+		f.At = fromMs(at)
+		return f, err
+	}, `SELECT id, label, summary, ref, at, actor, session FROM failures WHERE `+where+` ORDER BY at`, args...)
+}
+
+func (e *Engine) ruleTrace(id string) (*RuleTrace, error) {
+	r, err := e.Rule(id)
+	if err != nil {
+		return nil, err
+	}
+	rt := &RuleTrace{Rule: r}
+	cut := ms(r.ProposedAt)
+	if r.AdmittedAt != nil {
+		cut = ms(*r.AdmittedAt)
+	}
+	if r.Label != "" {
+		if rt.Failures, err = e.failures(`label = ? AND at <= ?`, r.Label, cut); err != nil {
+			return nil, err
+		}
+		if r.AdmittedAt != nil {
+			if rt.Since, err = e.failures(`label = ? AND at > ?`, r.Label, cut); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, f := range r.Why.Failures {
+		if fs, err := e.failures(`id = ?`, f); err == nil && len(fs) == 1 && !slices.ContainsFunc(rt.Failures, func(x Failure) bool { return x.ID == f }) {
+			rt.Failures = append(rt.Failures, fs[0])
+		}
+	}
+	if rt.Replaces, err = e.links(`SELECT dst, type FROM edges WHERE src = ? AND type = 'supersedes' ORDER BY at`, id); err != nil {
+		return nil, err
+	}
+	rt.History, err = e.history(id)
+	return rt, err
 }

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"cmp"
 	"context"
 	"errors"
 
@@ -287,6 +288,77 @@ var tools = []tool{
 		schema: obj(nil, map[string]any{}),
 		call: handler(func(_ context.Context, e *smem.Engine, _ struct{}) (any, error) {
 			return e.Review()
+		}),
+	},
+	{
+		name: "failure_record",
+		desc: "Record a failure: a broken build, a failing test, a change that had to be reverted, a mistake a person corrected. Use the same label for the same kind of failure. Repeated failures with one label are what justify a new rule.",
+		schema: obj([]string{"label", "summary"}, map[string]any{
+			"label":   str("Short kebab-case kind of failure, e.g. flaky-integration-test, forgot-migration, wrong-port."),
+			"summary": str("What went wrong, in one or two sentences."),
+			"ref":     str("Optional: test path, commit, bead id or URL."),
+		}),
+		call: handler(func(_ context.Context, e *smem.Engine, a struct {
+			Label   string `json:"label"`
+			Summary string `json:"summary"`
+			Ref     string `json:"ref"`
+		}) (any, error) {
+			id, promoted, err := e.RecordFailure(smem.FailureInput{Label: a.Label, Summary: a.Summary, Ref: a.Ref})
+			return map[string]any{"id": id, "admitted_rules": promoted}, err
+		}),
+	},
+	{
+		name: "rule_propose",
+		desc: "Propose a standing rule for agents in this project. Never write rules into CLAUDE.md or rule files yourself. A rule becomes active only with a reason: a person explicitly asked for it (why=requested, with by and their exact words in quote), repeated failures of one kind (why=incident, with the failure label, ideally enforced_by a test), or a recorded decision (why=decision). Anything else is kept as a held proposal for a person to review.",
+		schema: obj([]string{"text", "why"}, map[string]any{
+			"text":        str("The rule, as one instruction."),
+			"why":         enum("The reason.", "requested", "incident", "decision"),
+			"by":          str("requested: who asked."),
+			"quote":       str("requested: what they said, verbatim."),
+			"transcript":  str("requested: where they said it (transcript path or link)."),
+			"label":       str("incident: the failure label this rule prevents."),
+			"enforced_by": str("incident: the test or check that now catches it, e.g. test:./ci/migrations_test.go."),
+			"decision":    str("decision: the dec- id it carries out."),
+			"scope":       str("Optional scope; default scopes.write."),
+		}),
+		call: handler(func(_ context.Context, e *smem.Engine, a struct {
+			Text       string `json:"text"`
+			Why        string `json:"why"`
+			By         string `json:"by"`
+			Quote      string `json:"quote"`
+			Transcript string `json:"transcript"`
+			Label      string `json:"label"`
+			EnforcedBy string `json:"enforced_by"`
+			Decision   string `json:"decision"`
+			Scope      string `json:"scope"`
+		}) (any, error) {
+			if err := required(map[string]string{"text": a.Text, "why": a.Why}); err != nil {
+				return nil, err
+			}
+			return e.ProposeRule(smem.RuleInput{Text: a.Text, Scope: a.Scope, Label: a.Label,
+				Why: smem.Justification{Kind: a.Why, By: a.By, Quote: a.Quote, Transcript: a.Transcript,
+					Decision: a.Decision, EnforcedBy: a.EnforcedBy}})
+		}),
+	},
+	{
+		name:   "rules_list",
+		desc:   "The project's rules with their reasons. Active rules are in force; proposed ones are held for review.",
+		schema: obj(nil, map[string]any{"status": enum("Default active.", "active", "proposed", "suspect", "retired", "rejected")}),
+		call: handler(func(_ context.Context, e *smem.Engine, a struct {
+			Status string `json:"status"`
+		}) (any, error) {
+			type item struct {
+				ID     string `json:"id"`
+				Text   string `json:"text"`
+				Status string `json:"status"`
+				Reason string `json:"reason"`
+			}
+			rs, err := e.Rules(cmp.Or(a.Status, "active"))
+			out := []item{}
+			for _, r := range rs {
+				out = append(out, item{r.ID, r.Text, r.Status, cmp.Or(r.Basis, r.Held)})
+			}
+			return out, err
 		}),
 	},
 	{

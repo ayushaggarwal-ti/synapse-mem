@@ -473,6 +473,11 @@ func (e *Engine) Context(budget int) (string, error) {
 	if n := len(rv.Conflicts); n > 0 {
 		fmt.Fprintf(&b, "%d conflicting version(s) from different replicas need resolving. Run `smem review`.\n", n)
 	}
+	if rules, err := e.rulesContext(); err != nil {
+		return "", err
+	} else {
+		b.WriteString(rules) // standing instructions: outside the memory budget
+	}
 	if n, err := e.Quarantined(); err != nil {
 		return "", err
 	} else if n > 0 {

@@ -181,6 +181,41 @@ each other's work.
 **General.** Hooks find the store from the session's working directory.
 They never fail the agent, unless `hooks.require_store` is set.
 
+## Rules
+
+Agents add rules for themselves with no record of why, until nobody can
+tell which ones still matter. In smem a rule is only in force with a reason.
+There are three:
+- **requested:** a person asked. smem records who, and their words.
+- **incident:** the same kind of failure kept happening. Failures are
+  recorded with a label; ideally a test now enforces the rule.
+- **decision:** it carries out a recorded decision. It's flagged if that
+  decision is reverted.
+
+Anything else is held as a proposal for a person to approve or reject.
+
+```sh
+smem failure wrong-port "worker used 8080, config says 9090"   # agents call failure_record over MCP
+smem rules propose "Read ports from config; never hardcode them" --why incident --label wrong-port \
+     --enforced-by test:./config/ports_test.go                  # held until the second wrong-port failure
+smem rules propose "Run make test before committing" --why requested --by rahul --quote "always run the tests first"
+smem rules rationalize --import CLAUDE.md,.claude/rules/testing.md --judges
+smem rules render                                              # managed block in CLAUDE.md; --check for CI
+smem why rule-…                                                # who asked, which failures, what it replaced
+```
+
+`rationalize` imports existing hand-written rules as held proposals. It
+lists:
+- duplicates, by word overlap, and paraphrases if a judge is configured;
+- held proposals, and those whose reason now holds;
+- suspect rules;
+- ineffective rules: the failures they were meant to prevent happened anyway;
+- violated rules, stale rules, and scopes over the cap.
+
+Over MCP, agents get `failure_record`, `rule_propose` and `rules_list`, and
+are told never to write rules into `CLAUDE.md` themselves. All thresholds
+are configurable (`rules` in [docs/CONFIG.md](docs/CONFIG.md)).
+
 ## Configuration
 
 Everything that differs between teams is configuration. That includes bead

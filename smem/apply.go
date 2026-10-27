@@ -35,6 +35,9 @@ type memorySignal struct {
 	ID     string `json:"id"`
 	Signal string `json:"signal"`
 	Note   string `json:"note,omitempty"`
+	// Boost is the share of remaining doubt a confirmation removes:
+	// confidence c becomes 1 - (1-c)(1-boost).
+	Boost float64 `json:"boost,omitempty"`
 }
 
 type recallHit struct {
@@ -237,6 +240,10 @@ func apply(tx *sql.Tx, ev Event) error {
 			if p.Signal == "contradicted" {
 				a.status(p.ID, "contradicted", "", p.Note)
 			}
+			if p.Signal == "confirmed" && p.Boost > 0 {
+				a.exec(`UPDATE memories SET confidence0 = 1 - (1 - confidence0) * ? WHERE id = ?`, 1-min(p.Boost, 1), p.ID)
+				a.status(p.ID, "confirmed", "", p.Note)
+			}
 		}
 
 	case evMemoryArchived:
@@ -373,6 +380,9 @@ func apply(tx *sql.Tx, ev Event) error {
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				p.ID, a.at, ev.Actor, ev.Session, p.Decision, p.Bead, p.Tool, p.Summary, p.ArgsHash, p.ResultHash, p.Commit, p.Transcript, ev.ID)
 		}
+
+	default:
+		applyRuleEvent(a, ev, decode)
 	}
 	// Unknown event types are kept in the log and skipped here, so an older
 	// binary can still replay a log written by a newer one.
@@ -397,8 +407,14 @@ func trusted(q interface {
 // supersedes do not.
 func orderSensitive(ev Event) bool {
 	switch ev.Type {
-	case evKeyRegistered, evRecall, evMemorySignal, evSourceCaptured, evActionRecorded,
-		evJudgmentRecorded, evDecisionApproved:
+	case evMemorySignal:
+		// A confirmation changes confidence0, and reconfirm can set it
+		// outright: the two don't commute.
+		var p memorySignal
+		json.Unmarshal(ev.Payload, &p)
+		return p.Boost > 0
+	case evKeyRegistered, evRecall, evSourceCaptured, evActionRecorded,
+		evJudgmentRecorded, evDecisionApproved, evFailureRecorded, evRuleProposed, evRuleViolated:
 		return false
 	case evMemoryAsserted, evDecisionMade:
 		var p struct {

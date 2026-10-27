@@ -554,6 +554,62 @@ confidence has decayed below a threshold, most salient first, skipping any
 checked in the last day. Preferences and episodes aren't fact-checked.
 Evidence and the claim are redacted before leaving the machine.
 
+## 9a. Rules governance
+
+Agents create rules for themselves (in `CLAUDE.md`, `.claude/rules`, memory)
+with no record of why. Over time nobody can tell which rules still matter,
+which contradict each other, and which were one-off reactions. smem treats a
+rule as a record with a **reason**, behind an admission gate.
+
+**Records.**
+* `failure.recorded`: a failure with a label (`wrong-port`,
+  `migration-left-half-applied`), a summary and a reference.
+* `rule.proposed` and `rule.admitted`, then `rule.rejected`,
+  `rule.retired`, `rule.suspected`, `rule.reaffirmed` and `rule.violated`.
+  Rules are projections like everything else, so they replay, sync, verify
+  and can be traced with `why`.
+
+**The gate.** A proposal becomes active only if all of these hold:
+1. **A reason holds up.**
+   * *requested:* who asked, and their words.
+   * *incident:* `min_failures` with the rule's label within
+     `failure_window`, plus `enforced_by` if `require_enforcement` is set.
+   * *decision:* an active decision.
+   * *approved:* a named person.
+   * *merge:* every rule merged was active.
+2. **It isn't a near-duplicate** of an active rule in its scope (word
+   overlap ≥ `duplicate_at`).
+3. **The scope is under `max_active`.**
+
+A proposal that fails is kept with the reason it was held. It's promoted
+automatically when enough labeled failures arrive (`auto_promote`), or by a
+person (`rules approve --by`).
+
+**Propagation.** A rule justified by a decision has a `justified_by` edge to
+it. Reverting the decision, or the decision becoming suspect, flags the rule
+suspect through the same propagation as memories and decisions, and
+`review` lists it.
+
+**Rationalize** reviews the whole set. It doesn't change anything; it lists:
+* duplicates, by word overlap. With `--judges`, it also asks a typed
+  question (`same_rule`, a probability) about the 15 most similar pairs that
+  share at least one word, which catches paraphrases;
+* held proposals, and those that would now pass;
+* suspect rules;
+* **ineffective** rules: failures with their label after admission;
+* violated rules;
+* **stale** rules: no activity within `stale_after`;
+* scopes over the cap.
+
+`--import` reads existing `CLAUDE.md` and rule files: bullets, with their
+continuation lines, and imperative sentences, skipping code blocks and
+smem's own block. Each becomes a held proposal citing its file and line.
+
+**Render** writes active rules, each with its id and basis, between
+`<!-- smem:rules:start -->` and `<!-- smem:rules:end -->` in `rules.file`.
+Everything outside the block is left alone. `--check` fails if the file is
+out of date, for CI. `rules.in_context` also injects them at session start.
+
 ## 10. Performance
 
 Measured on an M5 Ultra (`SMEM_SCALE=1 go test -run TestScale ./smem/`), with
@@ -594,9 +650,9 @@ Known costs as the store grows:
 
 ## 11. Where to go next
 
-1. **Rules governance.** Rules admitted only with a recorded reason (explicit
-   request, repeated incidents plus a test, or a decision), with duplicate
-   detection via the judge layer and `smem rules rationalize`.
+1. **Rules: closing the loop.** Detect rule violations from tool calls (a
+   rule can name a check), and link each failure to the session that caused
+   it.
 2. **Semantic recall.** Add embeddings (sqlite-vec) as another relevance
    signal next to bm25; `auth` should find "authentication".
 3. **Extraction and consolidation.** A pass at session end proposes memories
@@ -631,6 +687,7 @@ Known costs as the store grows:
 | `smem/sync.go` | Import, export, directory remote |
 | `smem/hook.go` | Hook capture, spool, decision linking, process-tied sessions |
 | `smem/doctor.go` | `doctor`, `stats`, judge ping |
+| `smem/rules.go` | Failures, rules, the admission gate, rationalize, import, render |
 | `smem/fileid_*.go` | Database file identity, for detecting copies |
 | `smem/redact.go` | Secret redaction, checker environment |
 | `smem/factcheck.go` | Checkers, evidence gathering, fact-check cascade, judgments |

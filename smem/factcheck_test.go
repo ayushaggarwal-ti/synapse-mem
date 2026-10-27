@@ -195,7 +195,8 @@ func TestFactCheckWithoutEvidenceOrJudges(t *testing.T) {
 	m := remember(t, e, "fact", "a lonely fact with nothing to check it against")
 	res, err := e.FactCheck(context.Background(), m, true)
 	ok(t, err)
-	if res.Verdict.Label != Insufficient || res.Action != "none" || res.DecidedBy != "none" {
+	if res.Verdict.Label != Insufficient || res.Action != "not-judged" || !res.NotJudged ||
+		!strings.Contains(res.Verdict.Reason, "no judge configured") {
 		t.Fatalf("%+v", res)
 	}
 	// Judgments are projections like everything else.

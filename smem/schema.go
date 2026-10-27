@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS key_trust (key_id TEXT PRIMARY KEY, trusted INTEGER N
 // viewTables are projections of the event log. Rebuild drops and replays them.
 var viewTables = []string{
 	"keys", "memories", "memories_fts", "decisions", "decisions_fts", "options",
-	"assumptions", "sources", "edges", "accesses", "actions", "approvals", "status_log", "judgments", "judge_runs",
+	"assumptions", "sources", "edges", "accesses", "actions", "approvals", "status_log", "judgments", "judge_runs", "rules", "failures",
 }
 
 const viewsSchema = `
@@ -120,4 +120,4 @@ var migrations = []struct{ table, column, ddl string }{
 
 // viewsVersion changes whenever viewsSchema or apply changes in a way that
 // needs existing projections rebuilt.
-const viewsVersion = "4"
+const viewsVersion = "5"

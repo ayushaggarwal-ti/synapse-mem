@@ -37,3 +37,15 @@ Call `decision_record` for choices someone could reasonably question: an archite
 ## Answer "why?"
 
 For "why is it like this?" or "why did we do X?", call `why` with a decision or memory id, a commit sha or a bead id (in the project's prefix, e.g. `dojo-j6lv.1`). Use `review` to see what has become doubtful since.
+
+## Rules: only with a reason
+
+Don't write rules into CLAUDE.md, AGENTS.md or `.claude/rules` yourself. Rules pile up, and nobody can tell later which ones still matter.
+
+- When something fails (a test, a build, a change that had to be reverted, a correction from a person), call `failure_record` with a short, consistent label.
+- To add a rule, call `rule_propose` with its reason. There are three:
+  - `requested`: a person explicitly asked. Give `by` and their exact words in `quote`.
+  - `incident`: the same failure keeps happening. Give its `label`, and ideally `enforced_by` naming the test you added to catch it.
+  - `decision`: it carries out a recorded decision.
+- A rule without a reason that holds up is kept as a proposal for a person to review. It is not in force.
+- Active rules are rendered into CLAUDE.md by `smem rules render`. `rules_list` shows them with their reasons.

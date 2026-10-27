@@ -127,7 +127,7 @@ func rebuildViews(tx *sql.Tx) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(viewsSchema); err != nil {
+	if _, err := tx.Exec(viewsSchema + rulesSchema); err != nil {
 		return err
 	}
 	evs, err := selectAll(tx, scanEvent, `SELECT `+eventCols+` FROM events ORDER BY at, replica, rseq`)
