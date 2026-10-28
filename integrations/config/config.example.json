@@ -1,0 +1,12 @@
+{
+  "actor": "my-agent-1",
+  "scopes": {"read": ["team", "project:my-app*"], "write": "project:my-app"},
+  "context": {"budget": 4000, "kinds": [], "reinforce": false, "on": ["startup", "clear"]},
+  "decay": {"clock": "active", "idle_after": "24h"},
+  "judges": {
+    "jev": {"disabled": true},
+    "claude": {"when": "always", "model": "my-gateway/claude-haiku-4-5-20251001", "effort": "low",
+               "max_attempts": 4, "max_concurrent": 2}
+  },
+  "factcheck": {"min_agreeing": 1, "daily_budget": 200}
+}

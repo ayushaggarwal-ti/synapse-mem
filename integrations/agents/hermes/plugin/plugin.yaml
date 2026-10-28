@@ -1,0 +1,4 @@
+name: synapse-mem
+version: 0.1.0
+description: "synapse-mem (smem) — local belief memory with decay, decision provenance and a signed audit log. Embedded SQLite via the smem CLI; no network, no API keys."
+kind: exclusive
