@@ -40,7 +40,7 @@ or proxy, an Anthropic-compatible endpoint that authenticates with custom header
 
 | Setting | Where | Example |
 |---|---|---|
-| `ANTHROPIC_BASE_URL` | env, or `endpoints.claude` in the local config | `https://gateway.example.com` |
+| `ANTHROPIC_BASE_URL` | env, or `endpoints.claude` in the local config; if both are set, `endpoints.claude` wins | `https://gateway.example.com` |
 | `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` | env only | any non-empty value if the gateway authenticates by header |
 | `ANTHROPIC_CUSTOM_HEADERS` | env only | `"x-gateway-key: …\nx-team-token: …"`, newline-separated `Name: value` lines |
 | `SMEM_JUDGE_MODEL` | env (per agent), or `judges.claude.model` in config | the gateway's id for the model, e.g. `my-gateway/claude-haiku-4-5-20251001` |
@@ -49,6 +49,10 @@ These are the same variables Claude Code uses, so an agent already running Claud
 usually has all but `SMEM_JUDGE_MODEL` set. smem never reads Claude Code's `ANTHROPIC_DEFAULT_*_MODEL`
 variables, so name the judge model explicitly whenever your gateway prefixes model ids. Header values
 are treated as secrets: they are redacted from the log and never passed to checkers.
+
+The example config leaves `endpoints.claude` out so `ANTHROPIC_BASE_URL` (set by `judge-gateway.example.sh`) selects
+the gateway. To pin the gateway in the local config instead, add `"endpoints": {"claude": "https://gateway.example.com"}`;
+it then overrides the environment variable.
 
 The example config also disables Jev (`judges.jev.disabled`), runs Claude on every check
 (`judges.claude.when: "always"`) and lowers `factcheck.min_agreeing` to 1. With only one judge, the
