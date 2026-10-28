@@ -27,8 +27,10 @@ smem keys                          # note the other machines' key-… ids
   than silently minting a new identity.
 - smem never syncs on its own: hooks, the MCP server and agent adapters only write locally. Run `smem sync` on a
   schedule, or before and after work.
-- A copied or restored database continues as a new replica instead of forking the old one, so cloning
-  a store to a new machine is safe.
+- A copied or restored database that already holds events continues as a new replica instead of forking
+  the old one. An empty copy keeps the original replica ID, so two empty clones can collide on their first
+  writes. Create each machine's store fresh (`setup-store.sh`) and pull from the remote rather than copying
+  an empty database.
 
 ## 2. Team memory, read-only, from a curator
 
@@ -44,15 +46,19 @@ smem --db /srv/curator/.smem/smem.db sync team
 ../install/setup-store.sh ~/code/my-app --pull-only team=/shared/team-memory --trust key-<curator> --sync
 ```
 
-- Agents trust only the curator's key. Anything else that lands in the feed stays quarantined.
+- Agents trust only the curator's key. Events from any other key the feed publishes stay quarantined; events
+  signed by a key the store doesn't know are rejected.
+- A new key must be pulled before it can be trusted, so keep `--sync` on the first run: the script pulls,
+  then applies `--trust`.
 - `scopes.read` in the agent's project config chooses which of the curator's scopes the agent sees,
   e.g. `["team", "project:my-app*"]`.
 - `--sync` on a pull-only remote only pulls.
 
 ## 3. Trust and quarantine
 
-Events signed by keys you haven't trusted are verified and stored, but **quarantined**. They are never
-recalled and never injected into a prompt.
+Events signed by a known but untrusted key (one the store has seen, such as published with a pulled feed) are
+verified and stored, but **quarantined**. They are never recalled and never injected into a prompt. Events signed by a key the
+store has never seen are rejected on import.
 
 ```sh
 smem sync                           # "N event(s) signed by untrusted keys are quarantined"
@@ -68,12 +74,12 @@ smem review                         # suspect, at-risk and conflicting records; 
   you trust anyone.
 - Imports refuse events dated more than `sync.max_future_skew` ahead, and clamp events backdated past
   `sync.max_backdate`. A remote therefore can't rewrite what as-of queries say was known.
-- Recommended routine for a new key: `sync` → `keys` → spot-check with `why` and `recall --known-at` →
-  `trust` → `verify`.
+- Recommended routine for a new key: `sync` → `keys` → spot-check with `why` → `trust` → `recall --known-at`
+  → `verify`. Trusting replays the log, so quarantined events only become recallable afterwards.
 
 ## Moving events without a shared directory
 
 ```sh
 smem export > events.jsonl          # optionally --replica rep-…
-smem import events.jsonl            # verified like a pull; untrusted keys still quarantined
+smem import events.jsonl            # verified like a pull; unknown keys are rejected, known untrusted keys quarantined
 ```
