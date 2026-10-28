@@ -43,8 +43,13 @@ db = Path(HOME) / "synapse" / "smem.db"
 check("initialize creates per-profile store", db.exists() and not (db.parent / ".smem").exists(), str(db))
 check("system_prompt_block non-empty", "decision_why" in p.system_prompt_block())
 names = {s["name"] for s in p.get_tool_schemas()}
-check("7 tool schemas", names == {"memory_remember", "memory_recall", "memory_update", "decision_record",
-                                  "decision_outcome", "decision_why", "memory_review"}, str(sorted(names)))
+check("13 tool schemas", names == {"memory_remember", "memory_recall", "memory_update", "decision_record",
+                                   "decision_outcome", "decision_why", "memory_review", "memory_signal",
+                                   "memory_context", "failure_record", "rule_propose", "rules_list", "factcheck"},
+      str(sorted(names)))
+check("every schema has a handler", names == set(p._TOOLS))
+check("system_prompt_block names the new tools",
+      all(t in p.system_prompt_block() for t in ("memory_signal", "failure_record", "rule_propose", "rules_list")))
 
 r = json.loads(p.handle_tool_call("memory_remember", {"content": "The T2 work repo is hermes-setup",
                                                       "kind": "fact", "scope": "test", "volatility": "stable"}))
@@ -265,6 +270,132 @@ try:
 except Exception as e:  # noqa: BLE001
     check("broken store -> tool-call capture fails open", False, repr(e))
 broken.shutdown()
+
+# The tools beyond the core seven, on a store of their own.
+t = load_memory_provider("synapse-mem", register_skills=False)
+p.save_config({"store_path": str(Path(tempfile.mkdtemp(prefix="smem-tools-")) / "smem.db")}, HOME)
+t.initialize("s30", hermes_home=HOME, platform="cli", agent_context="primary")
+for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+          "TYPESAFE_API_KEY", "OPENROUTER_API_KEY"):
+    t._env.pop(k, None)
+t._env["SMEM_CONFIG"] = str(Path(HOME) / "no-local-smem-config.json")
+call = lambda name, a: json.loads(t.handle_tool_call(name, a))  # noqa: E731
+why = lambda ref: json.loads(t._run(["why", ref, "--json"]))  # noqa: E731
+
+base = call("memory_remember", {"content": "The deploy target is fly.io", "kind": "fact"})["memory_id"]
+r = call("memory_remember", {"content": "Deploys need the fly CLI", "kind": "procedure",
+                             "derived_from": [base, "file:fly.toml"]})
+derived = r.get("memory_id", "")
+lineage = lambda ref: [x.get("id") for x in why(ref).get("memory", {}).get("derived_from") or []]  # noqa: E731
+links = lineage(derived)
+check("memory_remember derived_from -> lineage", derived.startswith("mem-") and base in links
+      and any(x.startswith("src-") for x in links), json.dumps(links))
+check("memory_remember derived_from not a list -> error",
+      "error" in call("memory_remember", {"content": "x", "derived_from": "mem-1"}))
+r = call("memory_update", {"memory_id": derived, "action": "supersede", "content": "Deploys need flyctl >= 0.3",
+                           "derived_from": [base]})
+new = r.get("result", "").split()[0] if r.get("result") else ""
+check("memory_update supersede derived_from -> lineage",
+      base in lineage(new), json.dumps(r))
+
+r = call("memory_signal", {"memory_id": base, "signal": "confirmed", "note": "checked fly.toml"})
+check("memory_signal confirmed", r.get("success") and r.get("signal") == "confirmed", json.dumps(r))
+sigs = why(base).get("memory", {}).get("signals") or {}
+check("memory_signal recorded on the memory", sigs.get("confirmed") == 1, json.dumps(sigs))
+check("memory_signal bad signal -> error",
+      "error" in call("memory_signal", {"memory_id": base, "signal": "liked"}))
+check("memory_signal unknown memory -> error",
+      "error" in call("memory_signal", {"memory_id": "mem-doesnotexist", "signal": "used"}))
+check("memory_signal missing signal -> error", "error" in call("memory_signal", {"memory_id": base}))
+
+r = call("memory_context", {})
+check("memory_context returns smem context", r.get("context", "").startswith("## smem: recalled memories")
+      and "fly.io" in r["context"] and r.get("count", 0) >= 1, json.dumps(r)[:200])
+r = call("memory_context", {"budget": 120})
+check("memory_context budget limits memories", r.get("count") == 0 and "fly" not in r.get("context", "x"),
+      json.dumps(r)[:200])
+log = json.loads(t._run(["log", "--type", "recall", "--json", "--limit", "1"]) or "[]")
+check("memory_context logged as injected", bool(log) and log[0].get("payload", {}).get("injected"), json.dumps(log)[:200])
+check("memory_context bad budget -> error", "error" in call("memory_context", {"budget": "lots"}))
+
+r = call("decision_record", {"question": "Where to deploy?", "choice": "fly.io", "rationale": "cheap"})
+d1 = r.get("decision_id", "")
+r = call("decision_record", {"question": "Where to deploy?", "choice": "fly.io, two regions",
+                             "rationale": "latency", "bead": "bd-42", "supersedes": d1})
+d2 = r.get("decision_id", "")
+w = why("bd-42")
+got = next((x["decision"] for x in w.get("decisions") or [] if x["decision"]["id"] == d2), {})
+check("decision_record bead + supersedes pass through", got.get("bead") == "bd-42" and got.get("supersedes") == d1,
+      json.dumps(got)[:300])
+check("decision_record supersedes unknown -> error", "error" in call("decision_record", {
+    "question": "q", "choice": "c", "rationale": "r", "supersedes": "dec-doesnotexist"}))
+
+r = call("failure_record", {"label": "forgot-migration", "summary": "deploy failed: missing column", "ref": "bd-42"})
+f1 = r.get("failure_id", "")
+check("failure_record returns fail id", f1.startswith("fail-") and r.get("admitted_rules") == [], json.dumps(r))
+failures = t._run(["failures", "--label", "forgot-migration"])
+check("failure_record stored with label", f1 in failures and "missing column" in failures, failures)
+r = call("failure_record", {"label": "dash-summary", "summary": "-v flag broke the build"})
+check("failure_record summary starting with '-' is content, not a flag", r.get("failure_id", "").startswith("fail-"),
+      json.dumps(r))
+check("failure_record missing summary -> error", "error" in call("failure_record", {"label": "x"}))
+
+r = call("rule_propose", {"rule": "Run migrations before deploying", "why": "incident",
+                          "label": "forgot-migration", "enforced_by": "test:./ci/migrations_test.go"})
+held = r.get("rule_id", "")
+check("rule_propose incident below threshold -> held proposal",
+      held.startswith("rule-") and r.get("status") == "proposed" and not r.get("admitted") and r.get("reason"),
+      json.dumps(r))
+r = call("failure_record", {"label": "forgot-migration", "summary": "again: missing column"})
+check("second failure admits the held rule", r.get("admitted_rules") == [held], json.dumps(r))
+r = call("rule_propose", {"rule": "Use tabs", "why": "requested", "by": "ayush", "quote": "use tabs please"})
+asked = r.get("rule_id", "")
+check("rule_propose requested with quote -> active", r.get("status") == "active" and r.get("admitted"), json.dumps(r))
+r = call("rule_propose", {"rule": "Follow the deploy decision", "why": "decision", "decision": d2})
+check("rule_propose decision -> active", r.get("status") == "active", json.dumps(r))
+r = call("rule_propose", {"rule": "Be careful", "why": "requested"})
+vague = r.get("rule_id", "")
+check("rule_propose without by/quote -> held", r.get("status") == "proposed", json.dumps(r))
+check("rule_propose bad why -> error", "error" in call("rule_propose", {"rule": "x", "why": "vibes"}))
+check("rule_propose missing why -> error", "error" in call("rule_propose", {"rule": "x"}))
+
+r = call("rules_list", {})
+active = {x["id"]: x for x in r.get("rules") or []}
+check("rules_list default active", held in active and asked in active and vague not in active
+      and all(x["status"] == "active" and x["reason"] for x in active.values()), json.dumps(r)[:300])
+r = call("rules_list", {"status": "proposed"})
+check("rules_list proposed shows held reason",
+      [x["id"] for x in r.get("rules") or []] == [vague] and r["rules"][0]["reason"], json.dumps(r)[:300])
+check("rules_list all", call("rules_list", {"status": "all"}).get("count") == 4)
+check("rules_list bad status -> error", "error" in call("rules_list", {"status": "everything"}))
+
+r = call("factcheck", {"memory_ids": [base]})
+res = (r.get("results") or [{}])[0]
+check("factcheck without judges -> not_judged, not an error",
+      res.get("id") == base and res.get("not_judged") and res.get("action") == "not-judged" and r.get("not_judged") == 1,
+      json.dumps(r)[:300])
+st = why(base).get("memory", {}).get("memory", {}).get("status")
+check("factcheck without judges changes nothing", st == "active", str(st))
+r = call("factcheck", {})
+check("factcheck with nothing due -> empty result, not an error", r.get("results") == [] and r.get("count") == 0,
+      json.dumps(r))
+r = call("factcheck", {"memory_ids": [base, new], "dry_run": True})
+check("factcheck several ids", [x["id"] for x in r.get("results") or []] == [base, new], json.dumps(r)[:200])
+check("factcheck unknown id -> error", "error" in call("factcheck", {"memory_ids": ["mem-doesnotexist"]}))
+check("factcheck superseded memory -> error", "error" in call("factcheck", {"memory_ids": [derived]}))
+check("factcheck too many ids -> error", "error" in call("factcheck", {"memory_ids": [base] * 21}))
+check("factcheck memory_ids not a list -> error", "error" in call("factcheck", {"memory_ids": base}))
+
+t._env["SMEM_DB"] = "/nonexistent/dir/smem.db"
+for name, a in [("memory_signal", {"memory_id": base, "signal": "used"}), ("memory_context", {}),
+                ("failure_record", {"label": "x", "summary": "y"}), ("rule_propose", {"rule": "x", "why": "requested"}),
+                ("rules_list", {}), ("factcheck", {"memory_ids": [base]})]:
+    try:
+        check(f"broken store -> {name} error JSON", "error" in call(name, a))
+    except Exception as e:  # noqa: BLE001
+        check(f"broken store -> {name} error JSON", False, repr(e))
+t.shutdown()
+p.save_config({"store_path": ""}, HOME)
 
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; FAILED: {failed}" if failed else ""))

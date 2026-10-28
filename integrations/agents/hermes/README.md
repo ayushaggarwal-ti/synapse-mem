@@ -39,15 +39,24 @@ the installed plugin, but keeps the store.
   so it doesn't depend on the session's cwd.
 - **Identity.** `SMEM_ACTOR=hermes-<platform>@<host>` and `SMEM_SESSION=<hermes session id>`. The actor
   is always set, so agent writes are never signed with a person's `SMEM_ACTOR` inherited from the shell.
-- **Tools.**
-  - `memory_remember`, `memory_recall`, `memory_update` (supersede, invalidate, retract, reconfirm)
-  - `decision_record`, with rejected options, assumptions, used memories and evidence. It returns a
-    `commit_trailer` (`Decision: dec-…`), and the system prompt tells the model to put it in commit
-    messages.
-  - `decision_outcome`
-  - `decision_why`, for provenance of a `dec-`/`mem-`/`asm-` id, commit sha or bead id. It runs in the
-    session's working directory, so a sha resolves through git, including `Decision:` trailers.
-  - `memory_review`, for suspect and at-risk records
+- **Tools.** 13 tools that together cover all 14 of `smem mcp`'s (`memory_update` also does MCP's
+  `memory_invalidate`).
+
+  | Tool | smem command | Notes |
+  |---|---|---|
+  | `memory_remember` | `remember --kind --scope --volatility --from` | `derived_from` becomes `--from` lineage |
+  | `memory_recall` | `recall --json --limit --kind` | |
+  | `memory_update` | `supersede` (with `--from`), `invalidate`, `retract`, `reconfirm` | |
+  | `memory_signal` | `signal <mem> used\|confirmed\|contradicted --note` | |
+  | `memory_context` | `context --budget` | logged as shown, not used |
+  | `memory_review` | `review --json` | suspect and at-risk records |
+  | `decision_record` | `decide --question --choice --why --reject --assume --used --evidence --bead --supersedes` | returns a `commit_trailer` (`Decision: dec-…`), and the system prompt tells the model to put it in commit messages |
+  | `decision_outcome` | `outcome <dec> success\|failure\|mixed --note` | |
+  | `decision_why` | `why <ref> --json` | runs in the session's working directory, so a sha resolves through git, including `Decision:` trailers |
+  | `failure_record` | `failure <label> <summary> --ref` | returns the rules the failure admitted |
+  | `rule_propose` | `rules propose --why --by --quote --transcript --label --enforced-by --decision --scope` | returns `active` or `proposed` (held) with smem's reason |
+  | `rules_list` | `rules list --status --json` | default `active` |
+  | `factcheck` | `factcheck <mem>… --json --dry-run`, or `--due --limit` with no ids | up to 120 s. Without judges each result is `not_judged` and nothing changes. Nothing due is an empty result, not an error |
 - **Session-start context.** The first prefetch of a new session runs `smem hook session-start`, and so
   does the first prefetch after `/new` or `/reset`. That is the same context Claude Code's SessionStart
   hook injects: salient memories within `context.budget`, filtered by `scopes.read` and `context.kinds`,
@@ -100,17 +109,15 @@ The reference is the plugin in `plugin/` at the repo root, README "Claude Code h
 | Actor | `hermes-<platform>@<host>`, the same `<client>@<short host>` shape as `claude-code@host` |
 | Redaction | smem redacts every payload before signing or spooling; the provider writes no memory or tool content to disk itself |
 
-Known limitations:
+Known limitations. The first two need smem changes, proposed in
+[../../docs/UPSTREAM-SUGGESTIONS.md](../../docs/UPSTREAM-SUGGESTIONS.md):
 - **Per-turn recall isn't in decision snapshots.** smem has no CLI flag to log a recall as injected
   without reinforcing it, so per-turn recall uses `--no-record`. A decision's snapshot ("memories in
-  view") is the session's latest logged recall. That is the session-start context or the model's own
-  `memory_recall`, never a per-turn injection.
-- **Tool surface.** The provider exposes 7 tools. `smem mcp` has 14. Missing are `memory_signal`,
-  `memory_context`, `failure_record`, `rule_propose`, `rules_list` and `factcheck`, plus `derived_from`
-  on remember and `bead`/`supersedes` on decisions. Use the CLI or an `smem mcp` entry for those.
-- **Content on argv.** The CLI takes memory and decision text as arguments, so it is visible in the
-  process list while each call runs. It is redacted before it is stored. Over MCP it would travel on
-  stdin.
+  view") is the session's latest logged recall. That is the session-start context, `memory_context` or
+  the model's own `memory_recall`, never a per-turn injection.
+- **Content on argv.** The CLI reads memory, decision, failure and rule text only from arguments, not
+  stdin, so it is visible in the process list while each call runs. It is redacted before it is
+  stored. Over MCP it would travel on stdin.
 - **Gateway processes.** The hook is process-wide and routes each call by its session id. Calls from
   sessions without a provider, such as subagents, go to the most recently initialized provider, so they
   carry that provider's platform in the actor.
