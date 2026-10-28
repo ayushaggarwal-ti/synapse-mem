@@ -72,14 +72,23 @@ event.
   commit messages. Run `why` in the session's working directory, so a commit sha resolves through git.
 - Add short usage rules to the system prompt. See
   [INSTRUCTIONS-template.md](agents/mcp/INSTRUCTIONS-template.md).
-- Hermes: `TOOL_SCHEMAS`, `_PROMPT_BLOCK`, `handle_tool_call`, `_tool_decide`, `_tool_why`.
+- For the full MCP surface, also wrap `signal`, `context`, `failure`, `rules propose`, `rules list --json`
+  and `factcheck --json`. Some CLI details are easy to miss:
+  - smem resumes flag parsing after each positional argument, so put `--` before every one
+    (`failure -- <label> -- <summary>`). Otherwise text that starts with `-` is read as a flag.
+  - `rules propose` and `failure` print text, not JSON. Parse the `<rule> admitted: …` and
+    `<rule> held (proposed, not active): …` lines.
+  - `factcheck --due` exits non-zero when nothing is due. Without judges, results come back with
+    `"not_judged": true` and exit 0.
+- Hermes: `TOOL_SCHEMAS`, `_PROMPT_BLOCK`, `handle_tool_call`, `_tool_decide`, `_tool_why`, `_positional`,
+  `_tool_rule_propose`, `_tool_factcheck`.
 
 ### 7. Fail open on every path
 - A missing binary, a broken store, a timeout, or a non-zero exit is logged and becomes empty context or
   a JSON tool error. Never raise into the agent's turn. `smem hook` commands exit 0 even on failure and
   report on stderr, so log stderr.
-- Give every call a timeout. Hermes uses 5 s for reads and hooks, 10 s for writes, and 2 s for the
-  first-turn context.
+- Give every call a timeout. Hermes uses 5 s for reads and hooks, 10 s for writes, 2 s for the
+  first-turn context, and 120 s for `factcheck`, whose judges are model calls.
 - Hermes: `SynapseMemProvider._run`, the `try` blocks in `prefetch`, `capture_tool_call`,
   `handle_tool_call` and `on_session_end`, and the fail-open checks in `tests/test_provider_e2e.py`.
 
