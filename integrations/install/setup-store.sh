@@ -7,11 +7,12 @@
 #                          the layout smem finds by walking up from cwd)
 #   --remote NAME=DIR      add a sync remote (repeatable); DIR is any shared directory
 #   --pull-only NAME=DIR   add a read-only remote, e.g. a team curator feed (repeatable)
-#   --trust KEY_ID         trust a signing key so its synced events are recalled (repeatable)
-#   --sync                 pull then push every remote once after setup
+#   --trust KEY_ID         trust a signing key so its synced events are recalled (repeatable); the key must
+#                          already be known to the store, so combine with --sync to pull it first
+#   --sync                 pull, apply --trust, then push every remote once after setup
 #   --project-config FILE  copy FILE to <store dir>/config.json if none exists yet
 #
-# Uses smem from $SMEM_BIN, else PATH.
+# Uses smem from $SMEM_BIN, else PATH. Exits nonzero if any pull, sync, trust or the final doctor check fails.
 set -eu
 
 usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit "${1:-0}"; }
@@ -58,7 +59,9 @@ if [ -n "$project_config" ] && [ ! -e "$store_dir/config.json" ]; then
   echo "project config: $store_dir/config.json"
 fi
 
-printf '%s\n' "$remotes" | while read -r mode spec; do
+failed=0
+
+while read -r mode spec; do
   [ -n "${spec:-}" ] || continue
   name=${spec%%=*}; dir=${spec#*=}
   if [ "$mode" = ro ]; then
@@ -69,21 +72,38 @@ printf '%s\n' "$remotes" | while read -r mode spec; do
     "$smem" --db "$db" remote add "$name" "$dir"
   fi
   echo "remote: $name -> $dir$([ "$mode" = ro ] && echo ' (pull-only)')"
-done
+done <<EOF2
+$remotes
+EOF2
+
+# Bare `smem sync` only covers origin, so walk every remote. A failure is recorded and the walk continues.
+sync_remotes() { # $1 = pull | sync
+  remote_list=$("$smem" --db "$db" remote list | grep -v '^no remotes' || true)
+  while read -r name _ flag; do
+    [ -n "${name:-}" ] || continue
+    if [ "${flag:-}" = "(pull-only)" ]; then
+      "$smem" --db "$db" pull "$name" || { echo "setup-store: pull $name failed" >&2; failed=1; }
+    elif [ "$1" = sync ]; then
+      "$smem" --db "$db" sync "$name" || { echo "setup-store: sync $name failed" >&2; failed=1; }
+    else
+      "$smem" --db "$db" pull "$name" || { echo "setup-store: pull $name failed" >&2; failed=1; }
+    fi
+  done <<EOF2
+$remote_list
+EOF2
+}
+
+# keys trust rejects a key the store hasn't seen, so pull first.
+[ "$do_sync" = 1 ] && sync_remotes pull
 
 for key in $trusts; do
-  "$smem" --db "$db" keys trust "$key"
+  "$smem" --db "$db" keys trust "$key" || {
+    echo "setup-store: could not trust $key; a new key must be pulled first (add --sync, or run \`smem pull <remote>\` and re-run with --trust)" >&2
+    failed=1
+  }
 done
 
-# Bare `smem sync` only covers origin, so walk every remote.
-if [ "$do_sync" = 1 ]; then
-  "$smem" --db "$db" remote list | grep -v '^no remotes' | while read -r name _ flag; do
-    if [ "${flag:-}" = "(pull-only)" ]; then
-      "$smem" --db "$db" pull "$name" || echo "setup-store: pull $name failed" >&2
-    else
-      "$smem" --db "$db" sync "$name" || echo "setup-store: sync $name failed" >&2
-    fi
-  done
-fi
+[ "$do_sync" = 1 ] && sync_remotes sync
 
-"$smem" --db "$db" doctor || true
+"$smem" --db "$db" doctor || failed=1
+exit "$failed"
