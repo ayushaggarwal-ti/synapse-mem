@@ -390,6 +390,36 @@ func TestHookRecordsActionsAndCommits(t *testing.T) {
 	}
 }
 
+func TestCommitLinkageFromAnyShellTool(t *testing.T) {
+	commit := `{"command":"git commit -m 'retry flaky test'"}`
+	for _, tc := range []struct {
+		name, tool, input, response, want string
+	}{
+		{"bash stdout", "Bash", commit, `{"stdout":"[main 3f2a9c1] retry flaky test"}`, "3f2a9c1"},
+		{"bash raw response", "Bash", commit, `"[main 3f2a9c1] retry flaky test"`, "3f2a9c1"},
+		{"other shell, stdout", "shell", commit, `{"stdout":"[main 3f2a9c1] retry flaky test"}`, "3f2a9c1"},
+		{"other shell, output", "terminal", commit, `{"output":"[fix (root-commit) 3f2a9c1] retry","exit_code":0}`, "3f2a9c1"},
+		{"no git commit in input", "terminal", `{"command":"git log -1"}`, `{"output":"[main 3f2a9c1] retry"}`, ""},
+		{"file write echoing commit text", "Write", `{"content":"run git commit"}`,
+			`{"filePath":"notes.md","content":"[main 3f2a9c1] retry"}`, ""},
+	} {
+		if got := commitFrom(tc.tool, json.RawMessage(tc.input), json.RawMessage(tc.response)); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+
+	e := newEngine(t, "agent", start())
+	e.Session = "sess-1"
+	dec, _, err := e.Decide(DecisionInput{Question: "fix flaky test?", Choice: "add retry"})
+	ok(t, err)
+	must[string](t)(e.RecordToolUse(HookInput{SessionID: "sess-1", ToolName: "terminal",
+		ToolInput:    json.RawMessage(commit),
+		ToolResponse: json.RawMessage(`{"output":"[main 3f2a9c1] retry flaky test\n 1 file changed","exit_code":0}`)}, false))
+	if tr := must[*Trace](t)(e.Why("3f2a9c1")); len(tr.Decisions) != 1 || tr.Decisions[0].Decision.ID != dec {
+		t.Fatal("a commit made by any shell tool should trace back to the decision")
+	}
+}
+
 func TestContextIsBudgetedAndAudited(t *testing.T) {
 	c := start()
 	e := newEngine(t, "alice", c)
