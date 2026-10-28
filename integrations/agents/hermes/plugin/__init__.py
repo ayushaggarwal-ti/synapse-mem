@@ -230,7 +230,12 @@ class SynapseMemProvider(MemoryProvider):
         self._cfg = cfg = _load_config(self._home)
         self._platform = kwargs.get("platform") or "cli"
         self._primary = (kwargs.get("agent_context") or "primary") == "primary"
-        self._max_prefetch = max(0, min(int(cfg.get("max_prefetch") or _DEFAULT_MAX_PREFETCH), _PREFETCH_CAP))
+        try:
+            raw = cfg.get("max_prefetch")
+            self._max_prefetch = (_DEFAULT_MAX_PREFETCH if raw in (None, "")
+                                  else max(0, min(int(raw), _PREFETCH_CAP)))
+        except (TypeError, ValueError):
+            self._max_prefetch = _DEFAULT_MAX_PREFETCH
         self._turn_capture = _as_bool(cfg.get("enable_turn_capture", False))
         self._bin = _resolve_bin(cfg)
         self._db = _store_path(cfg, self._home)

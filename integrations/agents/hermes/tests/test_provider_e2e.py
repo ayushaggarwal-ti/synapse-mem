@@ -134,6 +134,28 @@ p3._env["SMEM_DB"] = "/nonexistent/dir/smem.db"
 check("broken store -> prefetch ''", p3.prefetch("T2 work repo") == "")
 check("broken store -> tool error JSON", "error" in json.loads(p3.handle_tool_call("memory_remember", {"content": "x"})))
 
+# max_prefetch: 0 disables injection; junk falls back to the default without raising.
+p.save_config({"max_prefetch": 0}, HOME)
+z = load_memory_provider("synapse-mem", register_skills=False)
+z.initialize("s6", hermes_home=HOME, platform="cli")
+check("max_prefetch=0 preserved", z._max_prefetch == 0, str(z._max_prefetch))
+check("max_prefetch=0 -> prefetch ''", z.prefetch("where is the T2 work repo") == "")
+p.save_config({"max_prefetch": "abc"}, HOME)
+z = load_memory_provider("synapse-mem", register_skills=False)
+try:
+    z.initialize("s7", hermes_home=HOME, platform="cli")
+    check("max_prefetch='abc' -> default, no raise", z._max_prefetch == 10, str(z._max_prefetch))
+except Exception as e:  # noqa: BLE001
+    check("max_prefetch='abc' -> default, no raise", False, repr(e))
+p.save_config({"max_prefetch": 500}, HOME)
+z = load_memory_provider("synapse-mem", register_skills=False)
+z.initialize("s8", hermes_home=HOME, platform="cli")
+check("max_prefetch above cap is clamped", 0 < z._max_prefetch < 500, str(z._max_prefetch))
+p.save_config({"max_prefetch": None}, HOME)
+z = load_memory_provider("synapse-mem", register_skills=False)
+z.initialize("s9", hermes_home=HOME, platform="cli")
+check("max_prefetch=null -> default", z._max_prefetch == 10, str(z._max_prefetch))
+
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; FAILED: {failed}" if failed else ""))
 sys.exit(1 if failed else 0)

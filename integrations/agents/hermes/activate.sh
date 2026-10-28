@@ -57,6 +57,21 @@ cfg = json.load(open(p)) if os.path.exists(p) else {}
 print(os.path.expanduser(cfg.get("store_path") or os.path.join(sys.argv[1], "synapse", "smem.db")))' "$home")
 "$install_dir/setup-store.sh" "$store" "$@"
 
+# Later Hermes processes have neither $SMEM_BIN nor this PATH; the provider reads smem_bin from the profile config.
+if [ -n "${SMEM_BIN:-}" ]; then
+  python3 - "$home/synapse-mem.json" "$SMEM_BIN" <<'PY'
+import json, os, sys
+p, b = sys.argv[1:3]
+cfg = json.load(open(p)) if os.path.exists(p) else {}
+cfg["smem_bin"] = os.path.abspath(b) if os.sep in b else b
+tmp = p + ".tmp"
+with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+    json.dump(cfg, f, indent=2)
+os.replace(tmp, p)
+PY
+  echo "smem_bin: $SMEM_BIN (saved to $home/synapse-mem.json)"
+fi
+
 "$hermes" config set memory.provider synapse-mem >/dev/null
 provider=$("$hermes" config get memory.provider)
 [ "$provider" = synapse-mem ] || { echo "activate: memory.provider is '$provider', expected synapse-mem" >&2; exit 1; }
