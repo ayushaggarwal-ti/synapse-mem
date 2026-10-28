@@ -249,6 +249,10 @@ the API keys. Details and limits: DESIGN.md §7.
 | `ANTHROPIC_BASE_URL` + `ANTHROPIC_CUSTOM_HEADERS` | Claude judge through a gateway (headers are `Name: value` lines) |
 | `SMEM_JUDGE_MODEL` | Claude judge model for this agent, e.g. a gateway-prefixed id |
 
+## Agent integrations
+
+Agent integrations: see [integrations/](integrations/): a Hermes memory provider, Claude Code wiring, and a generic MCP config, plus install, store and sync scripts.
+
 ## Contributing
 
 Contributions are welcome: bug reports, fixes, new checkers or judges,
