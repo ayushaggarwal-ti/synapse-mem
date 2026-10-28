@@ -406,6 +406,50 @@ func TestContextIsBudgetedAndAudited(t *testing.T) {
 	}
 }
 
+func TestInjectedRecallIsInViewButNotReinforced(t *testing.T) {
+	c := start()
+	e := newEngine(t, "alice", c)
+	mem := remember(t, e, "fact", "deploys use the release train")
+	retrieved := func() int {
+		t.Helper()
+		var n int
+		ok(t, e.db.QueryRow(`SELECT count(*) FROM accesses WHERE memory_id = ? AND signal = 'retrieved'`, mem).Scan(&n))
+		return n
+	}
+
+	if hits := must[[]Scored](t)(e.Recall(RecallQuery{Text: "deploys", Injected: true})); len(hits) != 1 {
+		t.Fatalf("hits: %v", ids(hits))
+	}
+	evs := must[[]Event](t)(e.Events("", evRecall, 1))
+	var p recallPayload
+	if len(evs) != 1 || json.Unmarshal(evs[0].Payload, &p) != nil || !p.Injected {
+		t.Fatalf("an injected recall should be recorded as injected: %+v", evs)
+	}
+	if n := retrieved(); n != 0 {
+		t.Fatalf("an injected recall must not reinforce, got %d retrievals", n)
+	}
+
+	dec, _, err := e.Decide(DecisionInput{Question: "how to ship?", Choice: "release train"})
+	ok(t, err)
+	var snap Snapshot
+	ok(t, json.Unmarshal(must[Decision](t)(e.Decision(dec)).Snapshot, &snap))
+	if len(snap.Memories) != 1 || snap.Memories[0] != mem || snap.Recall != evs[0].ID {
+		t.Fatalf("the injected recall should be the decision's snapshot: %+v", snap)
+	}
+
+	ok(t, e.Rebuild())
+	if n := retrieved(); n != 0 {
+		t.Fatalf("replay must not reinforce an injected recall, got %d retrievals", n)
+	}
+	must[[]Scored](t)(e.Recall(RecallQuery{Text: "deploys"}))
+	if n := retrieved(); n != 1 {
+		t.Fatalf("a looked-up recall reinforces, got %d retrievals", n)
+	}
+	if _, err := e.Recall(RecallQuery{Text: "deploys", Injected: true, NoRecord: true}); err == nil {
+		t.Fatal("an injected recall that isn't recorded should be refused")
+	}
+}
+
 // --- sync -----------------------------------------------------------------
 
 func TestSyncTwoReplicas(t *testing.T) {

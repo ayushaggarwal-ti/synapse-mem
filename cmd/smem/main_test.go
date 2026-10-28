@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -128,5 +129,45 @@ func TestDoctorFlagsALostKey(t *testing.T) {
 	}
 	if err := run([]string{"remember", "--kind", "fact", "y"}, strings.NewReader(""), &out); err == nil {
 		t.Fatal("writing with a lost key must fail, not mint a new identity")
+	}
+}
+
+// newStore initializes a store in a fresh directory and returns a runner
+// for smem commands against it.
+func newStore(t *testing.T) func(stdin string, args ...string) (string, error) {
+	t.Helper()
+	t.Chdir(t.TempDir())
+	t.Setenv("SMEM_DB", "")
+	t.Setenv("SMEM_CONFIG", filepath.Join(t.TempDir(), "none.json"))
+	t.Setenv("SMEM_KEY_DIR", filepath.Join(t.TempDir(), "keys"))
+	t.Setenv("SMEM_ACTOR", "agent-1")
+	smem := func(stdin string, args ...string) (string, error) {
+		var out bytes.Buffer
+		err := run(args, strings.NewReader(stdin), &out)
+		return out.String(), err
+	}
+	if _, err := smem("", "init"); err != nil {
+		t.Fatal(err)
+	}
+	return smem
+}
+
+func TestRecallInjected(t *testing.T) {
+	smem := newStore(t)
+	if _, err := smem("", "remember", "--kind", "fact", "deploys use the release train"); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := smem("", "recall", "--injected", "deploys"); err != nil || !strings.Contains(out, "release train") {
+		t.Fatalf("recall --injected: %v\n%s", err, out)
+	}
+	out, err := smem("", "log", "--type", "recall", "--json")
+	var evs []struct {
+		Payload struct{ Injected bool }
+	}
+	if err != nil || json.Unmarshal([]byte(out), &evs) != nil || len(evs) != 1 || !evs[0].Payload.Injected {
+		t.Fatalf("recall --injected should log an injected recall: %v\n%s", err, out)
+	}
+	if _, err := smem("", "recall", "--injected", "--no-record", "deploys"); err == nil {
+		t.Fatal("--injected with --no-record should be refused")
 	}
 }
