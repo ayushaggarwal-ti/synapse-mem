@@ -14,6 +14,13 @@ The upstream plugin gives every repo you open in Claude Code:
    ```sh
    ../../install/install-smem.sh
    ```
+   The installer puts `smem` in `~/.local/bin`. The plugin wrapper does not look there, so unless that
+   directory is already on `PATH`, add it, for this shell and persistently:
+   ```sh
+   export PATH="$HOME/.local/bin:$PATH"
+   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc, ~/.profile
+   ```
+   Then start Claude Code from a shell that has it (restart GUI launchers too).
 2. Inside Claude Code:
    ```
    /plugin marketplace add rahulsub/synapse-mem
@@ -22,7 +29,18 @@ The upstream plugin gives every repo you open in Claude Code:
 3. Restart the session. `/mcp` should list `smem`, and `smem doctor` in any repo should show a store
    after the first session there.
 
-Each project gets `.smem/` on first use. Everything in it is already git-ignored except `config.json`.
+Each project gets `.smem/` on first use, unless a parent directory already has one: the plugin's
+`smem mcp --init` reuses the nearest store found by walking up from the working directory, and `SMEM_DB`
+overrides that discovery entirely. Everything in `.smem/` is already git-ignored except `config.json`.
+
+For a store isolated to one project (for example a repo nested inside another that has `.smem/`), create
+it first and make sure `SMEM_DB` is unset or points at it:
+
+```sh
+cd path/to/project
+env -u SMEM_DB smem init          # creates ./.smem/smem.db; walk-up now stops here
+# or pin it: export SMEM_DB=$PWD/.smem/smem.db
+```
 
 ## Plugin or per-project?
 
