@@ -5,6 +5,8 @@ Run with the Hermes venv python. HERMES_AGENT_DIR points at the hermes-agent che
 
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -155,6 +157,114 @@ p.save_config({"max_prefetch": None}, HOME)
 z = load_memory_provider("synapse-mem", register_skills=False)
 z.initialize("s9", hermes_home=HOME, platform="cli")
 check("max_prefetch=null -> default", z._max_prefetch == 10, str(z._max_prefetch))
+
+# Session-start context: first turn of a new or reset session only, like smem's SessionStart hook.
+repo = tempfile.mkdtemp(prefix="smem-repo-")
+git = lambda *a: subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True, check=True).stdout  # noqa: E731
+git("init", "-q", "-b", "main")
+git("config", "user.email", "t@example.com")
+git("config", "user.name", "t")
+mem_lines = lambda s: len(re.findall(r"^- \[mem-", s, re.M))  # noqa: E731
+c = load_memory_provider("synapse-mem", register_skills=False)
+c.initialize("s10", hermes_home=HOME, platform="cli", agent_context="primary", cwd=repo)
+out = c.prefetch("thanks!")
+check("session context on first turn, even for a trivial prompt", out.startswith("## smem: recalled memories")
+      and "terse code comments" in out, repr(out[:160]))
+st = c.recall_status()
+check("recall_status counts session-context memories", st is not None and st.count == mem_lines(out) > 0, repr(st))
+log = json.loads(c._run(["log", "--type", "recall", "--json", "--limit", "5"]) or "[]")
+check("session context logged as injected (shown, not used)",
+      any(e.get("session") == "s10" and e.get("payload", {}).get("injected") for e in log), json.dumps(log)[:300])
+check("session context only once per start", c.prefetch("thanks!") == "")
+out = c.prefetch("terse code comments")
+check("later turns: per-turn recall only", out.startswith("## synapse-mem") and "## smem:" not in out, repr(out[:120]))
+c.on_session_switch("s11", reset=True)
+check("reset switch (/new) re-injects (source clear)", "## smem: recalled memories" in c.prefetch("thanks!"))
+c.on_session_switch("s12", parent_session_id="s11")
+check("resume/branch switch does not inject (context.on default)", c.prefetch("thanks!") == "")
+c.on_session_switch("s12c", parent_session_id="s12", reason="compression")
+check("compression switch does not inject (context.on default)", c.prefetch("thanks!") == "")
+(db.parent / "config.json").write_text(json.dumps({"context": {"on": ["startup", "clear", "compact"]}}))
+c.on_session_switch("s12d", parent_session_id="s12c", reason="compression")
+check("compression injects when the store's context.on has compact", "## smem:" in c.prefetch("thanks!"))
+(db.parent / "config.json").unlink()
+p.save_config({"session_context": False}, HOME)
+off = load_memory_provider("synapse-mem", register_skills=False)
+off.initialize("s13", hermes_home=HOME, platform="cli")
+check("session_context=false -> no injection", off.prefetch("thanks!") == "")
+off.shutdown()
+p.save_config({"session_context": True, "max_prefetch": 0}, HOME)
+off = load_memory_provider("synapse-mem", register_skills=False)
+off.initialize("s14", hermes_home=HOME, platform="cli")
+check("max_prefetch=0 -> no session context either", off.prefetch("thanks!") == "")
+off.shutdown()
+p.save_config({"max_prefetch": None}, HOME)
+c2 = load_memory_provider("synapse-mem", register_skills=False)
+c2.initialize("s15", hermes_home=HOME, platform="cli", agent_context="subagent")
+check("non-primary context -> no session context", c2.prefetch("thanks!") == "")
+c2.shutdown()
+
+# Tool calls: through Hermes' own post_tool_call dispatch into smem's spool, then linked to the decision.
+from hermes_cli.lifecycle import invoke_hook  # noqa: E402
+
+c = load_memory_provider("synapse-mem", register_skills=False)
+c.initialize("s20", hermes_home=HOME, platform="cli", agent_context="primary", cwd=repo)
+r = json.loads(c.handle_tool_call("decision_record", {"question": "Where do probe files go?", "choice": "repo root",
+                                                      "rationale": "simplest"}))
+dec = r.get("decision_id", "")
+check("decision_record returns the commit trailer", r.get("commit_trailer") == f"Decision: {dec}", json.dumps(r))
+(Path(repo) / "a.txt").write_text("a\n")
+git("add", "a.txt")
+commit_out = git("commit", "-m", "add a")
+sha = git("rev-parse", "--short", "HEAD").strip()
+spool = db.parent / "spool"
+before = set(spool.glob("*.json")) if spool.exists() else set()
+secret = "sk-ant-api03-" + "x" * 90
+calls = [("terminal", {"command": "git commit -m 'add a'"}, json.dumps({"output": commit_out, "exit_code": 0})),
+         ("write_file", {"path": f"{repo}/b.txt", "content": "b"}, json.dumps({"bytes_written": 1})),
+         ("terminal", {"command": f"curl -H 'x-api-key: {secret}' https://example.com"}, json.dumps({"output": ""})),
+         ("read_file", {"path": f"{repo}/a.txt"}, json.dumps({"content": "a"})),
+         ("memory_recall", {"query": "x"}, "{}")]
+for name, a, res in calls:
+    invoke_hook("post_tool_call", tool_name=name, args=a, result=res, session_id="s20", task_id="", tool_call_id="t",
+                turn_id="", api_request_id="", duration_ms=1, status="ok", error_type=None, error_message=None)
+spooled = sorted(set(spool.glob("*.json")) - before)
+check("mutating calls spooled; read-only and own tools skipped", len(spooled) == 3, str(len(spooled)))
+raw = "".join(f.read_text() for f in spooled)
+check("spooled summaries are redacted", secret not in raw and "x-api-key" in raw, raw[:200])
+check("file tools summarized by path", f"{repo}/b.txt" in raw)
+r = json.loads(c.handle_tool_call("decision_why", {"reference": sha}))
+acts = [a for d in r.get("decisions") or [] for a in d.get("actions") or []]
+check("git commit captured with sha and linked to the session decision",
+      any(a.get("commit") == sha and a.get("decision_id") == dec for a in acts), json.dumps(r)[:300])
+check("actions signed by the Hermes actor", all(a.get("actor", "").startswith("hermes-cli@") for a in acts))
+r = json.loads(c.handle_tool_call("decision_record",
+                                  {"question": "Keep b.txt?", "choice": "yes", "rationale": "probe"}))
+dec2 = r["decision_id"]
+(Path(repo) / "c.txt").write_text("c\n")
+git("add", "c.txt")
+git("commit", "-q", "-m", f"add c\n\n{r['commit_trailer']}")
+r = json.loads(c.handle_tool_call("decision_why", {"reference": git("rev-parse", "HEAD").strip()}))
+check("decision_why <sha> follows the Decision: trailer in the session cwd",
+      any(d.get("decision", {}).get("id") == dec2 for d in r.get("decisions") or []), json.dumps(r)[:300])
+p.save_config({"capture_tool_calls": False}, HOME)
+nc = load_memory_provider("synapse-mem", register_skills=False)
+nc.initialize("s21", hermes_home=HOME, platform="cli")
+before = set(spool.glob("*.json"))
+invoke_hook("post_tool_call", tool_name="terminal", args={"command": "touch x"}, result="{}", session_id="s21")
+check("capture_tool_calls=false -> nothing spooled", set(spool.glob("*.json")) == before)
+nc.shutdown()
+c.shutdown()
+p.save_config({"capture_tool_calls": True}, HOME)
+broken = load_memory_provider("synapse-mem", register_skills=False)
+broken.initialize("s22", hermes_home=HOME, platform="cli")
+broken._env["SMEM_DB"] = "/nonexistent/dir/smem.db"
+try:
+    broken.capture_tool_call("terminal", {"command": "touch y"}, "{}", "s22")
+    check("broken store -> tool-call capture fails open", True)
+except Exception as e:  # noqa: BLE001
+    check("broken store -> tool-call capture fails open", False, repr(e))
+broken.shutdown()
 
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; FAILED: {failed}" if failed else ""))

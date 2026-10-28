@@ -26,5 +26,8 @@ Tools: `memory_recall`, `memory_context`, `memory_remember`, `memory_update`, `m
 `rule_propose`, `rules_list`. Hide any of them with `mcp.disable`, and replace the usage text the agent sees
 with `mcp.instructions`. Both go in the config; see [../../config/README.md](../../config/README.md).
 
+The MCP config gives the agent the tools, not the habit of using them. Paste
+[INSTRUCTIONS-template.md](INSTRUCTIONS-template.md) into the agent's rules file or system prompt.
+
 If your client supports lifecycle hooks, `smem hook session-start` prints the context to inject, and
 `smem hook post-tool-use` reads a Claude Code-shaped hook JSON on stdin.

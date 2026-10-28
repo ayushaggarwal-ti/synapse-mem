@@ -33,6 +33,11 @@ The reasoning behind adopting it is in [docs/DECISIONS.md](docs/DECISIONS.md).
 | Cursor, Windsurf, any MCP client | per client | merge `agents/mcp/mcp-config.json` | [agents/mcp/README.md](agents/mcp/README.md) |
 | Hermes | per profile | `agents/hermes/activate.sh` | MemoryProvider plugin; [agents/hermes/README.md](agents/hermes/README.md) |
 
+Agents that only speak MCP get the tools, not the habit of using them. Paste
+[agents/mcp/INSTRUCTIONS-template.md](agents/mcp/INSTRUCTIONS-template.md) into their rules. To wire a new
+agent fully (session-start context, tool-call capture, decision linkage), follow
+[CONTRIBUTING-agents.md](CONTRIBUTING-agents.md).
+
 ## Quick start (any agent)
 
 ```sh
@@ -53,11 +58,12 @@ Then wire your agent from the table above. For Claude Code in one repo, the sing
 install/          install-smem.sh, setup-store.sh: shared by every adapter
 agents/
   claude-code/    per-project script, per-user plugin notes, raw hooks snippet
-  mcp/            MCP server entry for any MCP-capable client
+  mcp/            MCP server entry and agent-instruction template for any MCP-capable client
   hermes/         Hermes-only adapter: plugin/ (MemoryProvider), activate.sh, tests/
 config/           project vs local config, judge-through-gateway example
 sync/             multi-machine, team curator feeds, trust and quarantine
 docs/             DECISIONS.md
+CONTRIBUTING-agents.md   checklist for wiring a new agent, with the Hermes adapter as reference
 ```
 
 Only `agents/hermes/` depends on Hermes. If this folder moves to its own repo, it keeps working as-is. The
