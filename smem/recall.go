@@ -33,6 +33,8 @@ type RecallQuery struct {
 	// decision show what the agent had in view, and they reinforce the
 	// memories returned, so only skip them for inspection.
 	NoRecord bool
+	// Broad keeps memories that match only one word of a multiword query.
+	Broad bool
 }
 
 // Scored is a recalled memory with its score breakdown.
@@ -127,6 +129,47 @@ func matchExpr(text, op string) string {
 	return strings.Join(terms, " "+op+" ")
 }
 
+// queryWords is the distinct words matchExpr turns into terms.
+func queryWords(text string) []string {
+	var words []string
+	for _, w := range wordRe.FindAllString(strings.ToLower(text), -1) {
+		if !slices.Contains(words, w) {
+			words = append(words, w)
+		}
+	}
+	return words
+}
+
+// coverageGate returns the rowids among pending that match at least need of
+// words. FTS5 decides each match, so stemming and prefixes agree with the
+// query that admitted the candidates.
+func (e *Engine) coverageGate(words []string, pending []int64, need int) (map[int64]bool, error) {
+	count := map[int64]int{}
+	keep := map[int64]bool{}
+	open := slices.Clone(pending)
+	for _, w := range words {
+		if len(open) == 0 {
+			break
+		}
+		query := `SELECT rowid FROM memories_fts WHERE memories_fts MATCH ? AND rowid IN (` + placeholders(len(open)) + `)`
+		matched, err := selectAll(e.db, func(s scanner) (int64, error) {
+			var id int64
+			return id, s.Scan(&id)
+		}, query, append([]any{`"` + w + `"*`}, anys(open)...)...)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range matched {
+			count[id]++
+			if count[id] >= need {
+				keep[id] = true
+			}
+		}
+		open = slices.DeleteFunc(open, func(id int64) bool { return keep[id] })
+	}
+	return keep, nil
+}
+
 // score computes ranked candidates for q without recording anything.
 func (e *Engine) score(q RecallQuery) ([]Scored, error) {
 	now, err := e.logNow()
@@ -144,11 +187,12 @@ func (e *Engine) score(q RecallQuery) ([]Scored, error) {
 
 	relevance := map[string]float64{}
 	var ids []string
+	rowids := map[string]int64{}
 	if expr := matchExpr(q.Text, "AND"); expr != "" {
 		// Memories matching every term rank best and keep the candidate set
 		// small; fall back to any term when that finds too few.
 		search := func(expr string) error {
-			rows, err := e.db.Query(`SELECT id, bm25(memories_fts) FROM memories_fts WHERE memories_fts MATCH ?
+			rows, err := e.db.Query(`SELECT id, rowid, bm25(memories_fts) FROM memories_fts WHERE memories_fts MATCH ?
 				ORDER BY bm25(memories_fts) LIMIT 200`, expr)
 			if err != nil {
 				return err
@@ -156,12 +200,14 @@ func (e *Engine) score(q RecallQuery) ([]Scored, error) {
 			defer rows.Close()
 			for rows.Next() {
 				var id string
+				var rowid int64
 				var b float64
-				if err := rows.Scan(&id, &b); err != nil {
+				if err := rows.Scan(&id, &rowid, &b); err != nil {
 					return err
 				}
 				if _, seen := relevance[id]; !seen {
 					relevance[id] = b
+					rowids[id] = rowid
 					ids = append(ids, id)
 				}
 			}
@@ -177,6 +223,23 @@ func (e *Engine) score(q RecallQuery) ([]Scored, error) {
 			}
 			for _, id := range ids[all:] {
 				relevance[id] *= 0.5 // any-term matches weigh half as much
+			}
+			if words := queryWords(q.Text); len(words) > 1 && !q.Broad && !e.Policy.Recall.Broad {
+				pending := make([]int64, 0, len(ids)-all)
+				for _, id := range ids[all:] {
+					pending = append(pending, rowids[id])
+				}
+				keep, err := e.coverageGate(words, pending, 2)
+				if err != nil {
+					return nil, err
+				}
+				ids = append(ids[:all], slices.DeleteFunc(ids[all:], func(id string) bool {
+					if keep[rowids[id]] {
+						return false
+					}
+					delete(relevance, id)
+					return true
+				})...)
 			}
 		}
 		if len(ids) == 0 {

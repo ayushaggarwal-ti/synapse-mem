@@ -130,3 +130,31 @@ func TestDoctorFlagsALostKey(t *testing.T) {
 		t.Fatal("writing with a lost key must fail, not mint a new identity")
 	}
 }
+
+func TestRecallBroadFlag(t *testing.T) {
+	proj := t.TempDir()
+	t.Setenv("SMEM_DB", "")
+	t.Setenv("SMEM_CONFIG", filepath.Join(t.TempDir(), "none.json"))
+	t.Setenv("SMEM_KEY_DIR", filepath.Join(t.TempDir(), "keys"))
+	t.Setenv("SMEM_ACTOR", "tester")
+	t.Chdir(proj)
+	do := func(args ...string) string {
+		var out bytes.Buffer
+		if err := run(args, strings.NewReader(""), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	do("init")
+	do("remember", "--kind", "fact", "Office espresso machine outages are reported to facilities")
+	do("remember", "--kind", "fact", "The staging database outages page the on-call engineer")
+	if got := do("recall", "--no-record", "--json", "--", "staging database outages"); strings.Contains(got, "espresso") || !strings.Contains(got, "on-call") {
+		t.Fatalf("default recall drops the one-word match:\n%s", got)
+	}
+	if got := do("recall", "--no-record", "--json", "--broad", "--", "staging database outages"); !strings.Contains(got, "espresso") {
+		t.Fatalf("--broad keeps it:\n%s", got)
+	}
+	if !strings.Contains(usage, "--broad") {
+		t.Fatal("the usage lists --broad")
+	}
+}

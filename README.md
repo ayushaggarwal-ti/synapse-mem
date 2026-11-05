@@ -86,6 +86,7 @@ smem init                                   # .smem/smem.db in this directory
 F=$(smem remember "orders table is append-only" --kind fact)
 smem remember "prefer boring tech" --kind preference
 smem recall orders --explain                # relevance × salience × confidence
+smem recall orders table --broad            # also memories matching just one word
 
 D=$(smem decide --question "fix bad totals?" --choice "insert correction rows" \
       --why "append-only keeps history" \

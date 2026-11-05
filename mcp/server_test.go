@@ -270,3 +270,32 @@ func TestDisabledToolsAreHidden(t *testing.T) {
 		t.Fatal("a disabled tool can't be called")
 	}
 }
+
+func TestMemoryRecallBroad(t *testing.T) {
+	e := open(t)
+	for _, c := range []string{"Office espresso machine outages are reported to facilities", "The staging database outages page the on-call engineer"} {
+		if _, err := e.Remember(smem.MemoryInput{Kind: "fact", Content: c}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rs := session(t, &Server{Engine: e},
+		call(1, "memory_recall", map[string]any{"query": "staging database outages"}),
+		call(2, "memory_recall", map[string]any{"query": "staging database outages", "broad": true}),
+	)
+	plain, _ := text(t, rs[0])
+	broad, _ := text(t, rs[1])
+	if strings.Contains(plain, "espresso") || !strings.Contains(plain, "on-call") {
+		t.Fatalf("default recall drops the one-word match: %s", plain)
+	}
+	if !strings.Contains(broad, "espresso") {
+		t.Fatalf("broad keeps it: %s", broad)
+	}
+	for _, tl := range tools {
+		if tl.name == "memory_recall" {
+			b, _ := json.Marshal(tl.schema)
+			if !strings.Contains(string(b), `"broad"`) {
+				t.Fatalf("the schema lists broad: %s", b)
+			}
+		}
+	}
+}
