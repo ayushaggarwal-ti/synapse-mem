@@ -55,7 +55,24 @@ _DERIVED_FROM = {"type": "array", "items": {"type": "string"},
 _SKIP_TOOLS = frozenset({
     "read_file", "search_files", "session_search", "skill_view", "skills_list", "web_extract", "web_search",
     "vision_analyze", "browser_snapshot", "browser_get_images", "browser_console", "read_terminal", "todo",
-    "clarify", "memory",
+    "clarify", "memory", "browser_back", "browser_forward", "browser_scroll", "browser_vision",
+})
+_WRAPPER_TOOLS = frozenset({"tool_call", "call_tool", "use_tool", "invoke_tool", "mcp_call", "dispatch_tool"})
+_WRAPPER_NAME_KEYS = ("tool_name", "name", "tool", "function")
+_WRAPPER_ARGS_KEYS = ("arguments", "args", "parameters", "params", "input")
+# Name tokens classify a call by mutation semantics: a mutating token always wins, otherwise a read token
+# marks it read-only. Unrecognized names, and the shell tools, are captured.
+_READ_TOKENS = frozenset({
+    "read", "get", "list", "describe", "search", "find", "show", "view", "fetch", "query", "lookup", "inspect",
+    "snapshot", "navigate", "goto", "scroll", "screenshot", "stat", "cat", "browse",
+})
+_MUTATING_TOKENS = frozenset({
+    "write", "create", "update", "delete", "remove", "set", "put", "post", "patch", "edit", "add", "move",
+    "rename", "run", "exec", "execute", "send", "click", "type", "press", "fill", "upload", "save", "append",
+    "insert", "replace", "apply", "push", "merge", "commit", "install", "kill", "start", "stop", "restart",
+    "submit", "drop", "clear", "reset", "revoke", "grant", "deploy", "publish", "cancel", "close", "open",
+    "terminal", "shell", "bash", "process", "mark", "assign", "approve", "archive", "forward", "connect",
+    "star", "subscribe", "transition", "schedule", "log", "resolve", "store", "check", "extract", "sync",
 })
 # smem extracts commit shas only from its shell tool, named after Claude Code's.
 _HOOK_TOOL_NAMES = {"terminal": "Bash"}
@@ -290,6 +307,28 @@ def _json_value(value: Any) -> Any:
         except ValueError:
             return value
     return value
+
+
+def _is_read_only(tool_name: str) -> bool:
+    tokens = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", tool_name).lower()
+    tokens = {t for t in re.split(r"[^a-z0-9]+", tokens) if t}
+    return not tokens & _MUTATING_TOKENS and bool(tokens & _READ_TOKENS)
+
+
+def _unwrap(tool_name: str, args: Any) -> tuple:
+    """The nested call inside a dispatch wrapper, repeatedly; the wrapper itself when none can be read."""
+    for _ in range(3):
+        if tool_name not in _WRAPPER_TOOLS or not isinstance(args, dict):
+            break
+        nested = next((args[k] for k in _WRAPPER_NAME_KEYS if args.get(k)), None)
+        inner = next((args[k] for k in _WRAPPER_ARGS_KEYS if k in args), None)
+        if isinstance(nested, dict):
+            inner = nested.get("arguments", inner)
+            nested = nested.get("name")
+        if not isinstance(nested, str) or not nested:
+            break
+        tool_name, args = nested, _json_value(inner) if inner is not None else {}
+    return tool_name, args
 
 
 class SmemError(RuntimeError):
@@ -591,8 +630,10 @@ class SynapseMemProvider(MemoryProvider):
 
     def capture_tool_call(self, tool_name: str, args: Any, result: Any, session_id: str = "") -> None:
         """Spool a mutating tool call through smem's post-tool-use hook, which redacts it before it hits disk."""
-        if not (self._ready and self._capture_tools) or not tool_name or tool_name in _SKIP_TOOLS \
-                or tool_name in self._TOOLS:
+        if not (self._ready and self._capture_tools) or not tool_name:
+            return
+        tool_name, args = _unwrap(tool_name, args)
+        if tool_name in _SKIP_TOOLS or tool_name in self._TOOLS or _is_read_only(tool_name):
             return
         try:
             tool_input = dict(args) if isinstance(args, dict) else {"input": args}

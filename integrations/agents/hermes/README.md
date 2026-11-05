@@ -70,8 +70,10 @@ the installed plugin, but keeps the store.
 - **Tool calls.** The plugin registers a `post_tool_call` hook. Each mutating tool call is piped to
   `smem hook post-tool-use`, which redacts it and writes it to the store's spool in about 10 ms. The next
   smem call records it as a signed action, linked to the session's decision when that is unambiguous.
-  Read-only tools, the built-in `memory` tool (already mirrored) and this provider's own tools are
-  skipped. smem extracts commit shas only from Claude Code's `Bash` tool, so `terminal` calls are sent
+  Read-only tools (discovery, list, get, describe, search and browser read or navigation calls), the
+  built-in `memory` tool (already mirrored) and this provider's own tools are skipped. A name with a
+  mutating word is always captured, and dispatch wrappers such as `tool_call` are classified by the call
+  they carry. smem extracts commit shas only from Claude Code's `Bash` tool, so `terminal` calls are sent
   under that name. A `git commit` then lets `decision_why <sha>` reach the decision.
 - **Writes are deliberate.** `sync_turn` is a no-op. The model writes through the tools.
 - **Native mirror.** Adds and replaces from Hermes' built-in memory tool are mirrored into smem under

@@ -327,6 +327,38 @@ git("commit", "-q", "-m", f"add c\n\n{r['commit_trailer']}")
 r = json.loads(c.handle_tool_call("decision_why", {"reference": git("rev-parse", "HEAD").strip()}))
 check("decision_why <sha> follows the Decision: trailer in the session cwd",
       any(d.get("decision", {}).get("id") == dec2 for d in r.get("decisions") or []), json.dumps(r)[:300])
+
+
+def fire(name, a):
+    before = set(spool.glob("*.json"))
+    invoke_hook("post_tool_call", tool_name=name, args=a, result="{}", session_id="s20", task_id="", tool_call_id="t",
+                turn_id="", api_request_id="", duration_ms=1, status="ok", error_type=None, error_message=None)
+    return len(set(spool.glob("*.json")) - before)
+
+
+read_calls = [("tool_search", {"query": "github"}), ("tool_describe", {"name": "terminal"}),
+              ("browser_navigate", {"url": "https://example.com"}), ("browser_snapshot", {}),
+              ("mcp_github_list_issues", {"repo": "a/b"}), ("github_get_pull_request", {"number": 1}),
+              ("mcp__drive__describe_file", {"id": "x"}),
+              ("tool_call", {"name": "tool_search", "arguments": {"query": "x"}}),
+              ("tool_call", {"tool_name": "mcp_jira_get_issue", "args": json.dumps({"key": "A-1"})}),
+              ("tool_call", {"function": {"name": "read_file", "arguments": {"path": "a.txt"}}}),
+              ("tool_call", {"name": "tool_call", "arguments": {"name": "list_files", "arguments": {}}})]
+check("discovery and read-only calls yield zero actions", all(fire(n, a) == 0 for n, a in read_calls),
+      str([n for n, a in read_calls if fire(n, a)]))
+check("write_file yields one action", fire("write_file", {"path": f"{repo}/w.txt", "content": "w"}) == 1)
+check("terminal yields one action", fire("terminal", {"command": "touch z"}) == 1)
+check("nested terminal yields one action",
+      fire("tool_call", {"name": "terminal", "arguments": {"command": "touch z"}}) == 1)
+check("nested mutating connector call yields one action",
+      fire("tool_call", {"name": "mcp_github_create_issue", "arguments": {"title": "t"}}) == 1)
+lost = ["log_work", "log_time", "mark_as_read", "mark_notifications_read", "resolve_comment_thread", "check_in",
+        "extract_and_store", "forward_email", "assign_issue", "approve_pull_request", "archive_thread"]
+check("mutations with read-like words are captured", all(fire(n, {"id": "1"}) == 1 for n in lost),
+      str([n for n in lost if fire(n, {"id": "1"}) != 1]))
+check("browser back and scroll navigation yield zero actions",
+      all(fire(n, {}) == 0 for n in ("browser_back", "browser_forward", "browser_scroll", "browser_vision")))
+check("unreadable wrapper is still captured", fire("tool_call", {"foo": "bar"}) == 1)
 p.save_config({"capture_tool_calls": False}, HOME)
 nc = load_memory_provider("synapse-mem", register_skills=False)
 nc.initialize("s21", hermes_home=HOME, platform="cli")
