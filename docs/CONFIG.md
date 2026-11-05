@@ -118,11 +118,18 @@ The other settings:
 ### `recall`
 
 ```json
-"recall": {"dedupe_window": "10m"}
+"recall": {"dedupe_window": "10m", "broad": false}
 ```
 
 A recall identical to one logged in the same session within the window
 (same query, same results) isn't logged again.
+
+A query of two or more distinct words returns a memory only if it matches at
+least two of them (or every word, for a two-word query). Without this a
+memory sharing a single word with the query would rank as a full match.
+`broad: true` returns memories that match any one word instead, for every
+recall. `smem recall --broad` and the `broad` argument of `memory_recall` do
+the same for one call. A binary without this key rejects a config that sets it.
 
 ### `sync`: what imports may claim about time
 

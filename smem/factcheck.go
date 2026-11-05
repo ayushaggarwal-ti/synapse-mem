@@ -639,7 +639,7 @@ func (e *Engine) gatherEvidence(m Memory, pol FactCheckPolicy) ([]Evidence, erro
 		}
 	}
 	if pol.RelatedMemories > 0 {
-		related, err := e.score(RecallQuery{Text: m.Content})
+		related, err := e.score(RecallQuery{Text: m.Content, Broad: true})
 		if err != nil {
 			return nil, err
 		}

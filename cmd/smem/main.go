@@ -35,7 +35,7 @@ Memory
   retract <mem>            it was never true       --reason
   reconfirm <mem>          checked, still true     --confidence --note
   signal <mem> used|confirmed|contradicted  --note
-  recall [query]           --kind --scope --limit --as-of --known-at --archived --no-record --explain --json
+  recall [query]           --kind --scope --limit --as-of --known-at --archived --no-record --broad --explain --json
   context                  memories for session start   --budget
   sweep                    archive faded memories   --threshold --idle --dry-run
 
@@ -639,13 +639,14 @@ func (c *cli) recall(args []string) error {
 	knownAt := fs.String("known-at", "", "as believed at this time")
 	archived := fs.Bool("archived", false, "include archived memories")
 	noRecord := fs.Bool("no-record", false, "don't record this recall")
+	broad := fs.Bool("broad", false, "match any query word, not at least two")
 	explain := fs.Bool("explain", false, "show score breakdown")
 	asJSON := fs.Bool("json", false, "JSON output")
 	pos, err := parse(fs, args)
 	if err != nil {
 		return err
 	}
-	q := smem.RecallQuery{Text: strings.Join(pos, " "), Kinds: kinds, Scope: *scope, Limit: *limit,
+	q := smem.RecallQuery{Broad: *broad, Text: strings.Join(pos, " "), Kinds: kinds, Scope: *scope, Limit: *limit,
 		IncludeArchived: *archived, NoRecord: *noRecord}
 	if q.AsOf, err = parseTime(*asOf); err != nil {
 		return err
