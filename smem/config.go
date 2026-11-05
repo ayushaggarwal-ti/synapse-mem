@@ -114,13 +114,11 @@ type DecayPolicy struct {
 	IdleAfter Duration `json:"idle_after"`
 }
 
-// RecallPolicy tunes recall matching and logging.
+// RecallPolicy tunes recall logging.
 type RecallPolicy struct {
 	// DedupeWindow skips logging a recall identical to one logged in the
 	// same session within this window (same query, same results).
 	DedupeWindow Duration `json:"dedupe_window"`
-	// Broad makes every recall behave as if RecallQuery.Broad were set.
-	Broad bool `json:"broad"`
 }
 
 // SyncPolicy bounds what imports may claim about time.

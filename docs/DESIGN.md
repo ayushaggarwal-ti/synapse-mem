@@ -124,11 +124,6 @@ salience   = σ(B + 2),  B = ln Σⱼ wⱼ · tⱼ^(−d_kind)        -- ACT-R b
 confidence = c₀ · ½^(Δt_verified / half_life[volatility]) · ½^(contradictions) · (½ if suspect)
 ```
 
-Relevance is relative to the best match, so candidates are first gated on
-absolute coverage: with two or more distinct query words, a memory must match
-at least two of them. Single-word and empty queries are not gated, and
-`recall.broad`, `--broad` or the MCP `broad` argument turns the gate off.
-
 * `tⱼ` is hours since access j (min 1 minute). ACT-R gives recency,
   frequency and the spacing effect for free.
 * Access weights `wⱼ`: asserted 1, retrieved 0.5, used 1, cited by a decision
