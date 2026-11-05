@@ -78,8 +78,12 @@ the installed plugin, but keeps the store.
 - **Writes are deliberate.** `sync_turn` is a no-op. The model writes through the tools.
 - **Native mirror.** Adds and replaces from Hermes' built-in memory tool are mirrored into smem under
   scope `hermes-native-<target>`.
-- **Session episode.** With `enable_turn_capture` on, a session of 3 or more messages ends with one
-  `episode` memory: the last question and the final answer.
+- **Episodes.** With `enable_turn_capture` on, an `episode` memory is stored at each compression and at
+  session end, never per turn. A compression episode holds up to the last 5 completed exchanges (each
+  part capped at 500 characters). A session-end episode holds the last completed exchange (each part
+  capped at 1200 characters). An unanswered prompt is skipped. Repeated notifications for one boundary
+  store one episode, including across restarts, and an exchange completed after compression is captured
+  at the next boundary. No model calls.
 - **Fail-open.** A missing binary or a broken store logs a warning. Prefetch returns nothing, tools
   return error JSON, and tool-call capture is skipped. A Hermes turn never breaks.
 
@@ -92,7 +96,7 @@ Settings live in `<profile>/synapse-mem.json` (written by `hermes memory setup` 
 | `max_prefetch` | 10 | memories injected per turn, 0–15; 0 also turns off session-start context |
 | `session_context` | true | inject smem's session-start context on the first turn |
 | `capture_tool_calls` | true | record mutating tool calls as signed actions |
-| `enable_turn_capture` | false | store a session-end episode |
+| `enable_turn_capture` | false | store episodes at compression and session end |
 
 smem's own settings (scopes, decay, judges) come from `<profile>/synapse/config.json`, which is the
 project config next to the store, and from the local config. See [../../config/README.md](../../config/README.md).

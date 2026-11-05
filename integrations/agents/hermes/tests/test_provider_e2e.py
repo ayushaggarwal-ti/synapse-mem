@@ -187,6 +187,55 @@ check("pairing: completed reply after tool use is stored",
       len(eps) == 1 and "zeta question about herons" in eps[0]["content"]
       and "zeta answer herons wade" in eps[0]["content"], json.dumps(eps)[:200])
 
+def _turns(*words):
+    out = []
+    for w in words:
+        out += [{"role": "user", "content": f"question about {w}"}, {"role": "assistant", "content": f"answer about {w}"}]
+    return out
+
+
+def _provider(sid, context="primary"):
+    pv = load_memory_provider("synapse-mem", register_skills=False)
+    pv.initialize(sid, hermes_home=HOME, platform="cli", agent_context=context)
+    return pv
+
+
+check("compression: no checkpoint capability advertised", _provider("s-c0").pre_compress_checkpoint_api_version == 1)
+p.save_config({"enable_turn_capture": False}, HOME)
+_provider("s-coff").on_pre_compress(_turns("kiwis", "lychees", "mangos"))
+p.save_config({"enable_turn_capture": True}, HOME)
+check("compression: nothing stored with capture off", not _episodes("kiwis"))
+
+pc = _provider("s-comp")
+before = _turns("kiwis", "lychees", "mangos") + [{"role": "user", "content": "interrupted prompt about durians"}]
+check("compression: returns no summary", pc.on_pre_compress(before) == "")
+pc.on_pre_compress(before)
+_provider("s-comp").on_pre_compress(before)
+eps = _episodes("kiwis")
+check("compression: one episode keeps every completed turn across repeated callbacks and restarts",
+      len(eps) == 1 and all(f"about {w}" in eps[0]["content"] for w in ("kiwis", "lychees", "mangos")),
+      json.dumps(eps)[:300])
+check("compression: interrupted prompt is not stored", not _episodes("durians"))
+
+squashed = [{"role": "user", "content": "[summary of earlier turns]"}, {"role": "assistant", "content": "understood"}]
+after = squashed + _turns("papayas", "guavas")
+pc.on_pre_compress(after)
+pc.on_pre_compress(after)
+eps = _episodes("papayas")
+check("compression: continuation captures a later completed turn once even at a reused message index",
+      len(eps) == 1 and "about guavas" in eps[0]["content"] and "kiwis" not in eps[0]["content"],
+      json.dumps(eps)[:300])
+
+pc.on_session_end(after)
+pc.on_session_end(after)
+ends = [e for e in _episodes("guavas") if e["content"].startswith("Session episode")]
+check("compression then session end stores one session episode with the last exchange",
+      len(ends) == 1 and "about guavas" in ends[0]["content"] and "papayas" not in ends[0]["content"],
+      json.dumps(ends)[:300])
+
+_provider("s-csub", "subagent").on_pre_compress(_turns("quinces", "figs", "plums"))
+check("compression: non-primary context skips writes", not _episodes("quinces"))
+
 sub = load_memory_provider("synapse-mem", register_skills=False)
 sub.initialize("s3", hermes_home=HOME, platform="cli", agent_context="subagent")
 sub.on_session_end([{"role": "user", "content": "subagent zebra"}, {"role": "assistant", "content": "x"},
@@ -202,6 +251,7 @@ bad.initialize("s4", hermes_home=HOME, platform="cli")
 check("broken smem_bin -> prefetch ''", bad.prefetch("T2 work repo") == "")
 check("broken smem_bin -> tool error JSON", "error" in json.loads(bad.handle_tool_call("memory_recall", {"query": "x"})))
 bad.on_session_end(msgs)
+check("broken smem_bin -> on_pre_compress fails open", bad.on_pre_compress(msgs) == "")
 bad.on_memory_write("add", "memory", "x")
 bad.shutdown()
 p.save_config({"smem_bin": ""}, HOME)

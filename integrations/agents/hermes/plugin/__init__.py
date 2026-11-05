@@ -37,6 +37,8 @@ _READ_TIMEOUT, _WRITE_TIMEOUT = 5, 10
 _HOOK_TIMEOUT = 5
 _EPISODE_MIN_MESSAGES = 3
 _EPISODE_PART_CHARS = 1200
+_COMPRESSION_EXCHANGES = 5
+_COMPRESSION_PART_CHARS = 500
 
 _KINDS = ["fact", "episode", "procedure", "preference", "insight"]
 _VOLATILITIES = ["volatile", "normal", "stable", "permanent"]
@@ -123,17 +125,23 @@ def _text(content: Any) -> str:
     return ""
 
 
-def _last_exchange(convo: List[Dict[str, Any]]) -> tuple:
-    """(prompt, reply, reply index) of the last prompt answered by a final text reply with no pending tool calls."""
-    pending, found = "", ("", "", -1)
+def _completed_exchanges(convo: List[Dict[str, Any]]) -> List[tuple]:
+    """(prompt, reply, reply index) for each prompt answered by a final text reply with no pending tool calls."""
+    pending, found = "", []
     for i, m in enumerate(convo):
         role = m.get("role")
         text = _text(m.get("content")).strip()
         if role == "user":
             pending = text
         elif role == "assistant" and text and not m.get("tool_calls") and pending:
-            found, pending = (pending, text, i), ""
+            found.append((pending, text, i))
+            pending = ""
     return found
+
+
+def _last_exchange(convo: List[Dict[str, Any]]) -> tuple:
+    found = _completed_exchanges(convo)
+    return found[-1] if found else ("", "", -1)
 
 
 def _schema(name: str, description: str, properties: dict, required: list) -> dict:
@@ -403,7 +411,7 @@ class SynapseMemProvider(MemoryProvider):
              "type": "boolean", "default": True},
             {"key": "capture_tool_calls", "description": "Record mutating tool calls as signed smem actions",
              "type": "boolean", "default": True},
-            {"key": "enable_turn_capture", "description": "Store a session-end episode for sessions with >=3 messages",
+            {"key": "enable_turn_capture", "description": "Store episodes of completed turns at compression and session end",
              "type": "boolean", "default": False},
         ]
 
@@ -647,31 +655,48 @@ class SynapseMemProvider(MemoryProvider):
         except Exception as e:
             logger.warning("synapse-mem tool-call capture failed: %s", e)
 
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    def _capture_episode(self, messages: List[Dict[str, Any]], boundary: str, render) -> None:
+        """Store one episode per boundary; render(exchanges) builds its content from the completed exchanges."""
         if not (self._ready and self._primary and self._turn_capture):
             return
         try:
             convo = [m for m in messages or [] if m.get("role") in ("user", "assistant", "tool")]
-            if len(convo) < _EPISODE_MIN_MESSAGES:
+            exchanges = _completed_exchanges(convo)
+            if len(convo) < _EPISODE_MIN_MESSAGES or not exchanges:
                 return
-            user, reply, reply_idx = _last_exchange(convo)
-            if not user or not reply:
-                return
-            marker = self._claim_boundary(f"{self._session_id}:{reply_idx}")
+            marker = self._claim_boundary(f"{self._session_id}:{boundary(exchanges[-1])}")
             if marker is None:
                 return
-            content = (f"Session episode ({self._platform}). User asked: {user[:_EPISODE_PART_CHARS]}\n"
-                       f"Assistant concluded: {reply[:_EPISODE_PART_CHARS]}")
             # Synchronous: session end is followed by process exit, which would kill a daemon writer.
             try:
-                mem_id = self._remember(content, kind="episode", scope=f"hermes-{self._platform}",
+                mem_id = self._remember(render(exchanges), kind="episode", scope=f"hermes-{self._platform}",
                                         volatility="volatile")
             except Exception:
                 marker.unlink(missing_ok=True)
                 raise
-            logger.info("synapse-mem: stored session episode %s", mem_id)
+            logger.info("synapse-mem: stored episode %s", mem_id)
         except Exception as e:
-            logger.warning("synapse-mem on_session_end failed: %s", e)
+            logger.warning("synapse-mem episode capture failed: %s", e)
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        def render(exchanges: List[tuple]) -> str:
+            body = "\n".join(f"User asked: {u[:_COMPRESSION_PART_CHARS]}\n"
+                             f"Assistant concluded: {r[:_COMPRESSION_PART_CHARS]}"
+                             for u, r, _ in exchanges[-_COMPRESSION_EXCHANGES:])
+            return f"Compression episode ({self._platform}).\n{body}"
+
+        # The digest keeps boundaries distinct when a compressed transcript reuses a message index.
+        self._capture_episode(messages, lambda x: "compress:%d:%s" % (
+            x[2], hashlib.sha256(f"{x[0]}\0{x[1]}".encode()).hexdigest()[:12]), render)
+        return ""
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        def render(exchanges: List[tuple]) -> str:
+            user, reply, _ = exchanges[-1]
+            return (f"Session episode ({self._platform}). User asked: {user[:_EPISODE_PART_CHARS]}\n"
+                    f"Assistant concluded: {reply[:_EPISODE_PART_CHARS]}")
+
+        self._capture_episode(messages, lambda x: str(x[2]), render)
 
     def _claim_boundary(self, boundary: str) -> Optional[Path]:
         """Atomically claim a capture boundary under the store directory; None if already claimed."""
