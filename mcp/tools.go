@@ -85,16 +85,14 @@ var tools = []tool{
 			"kind":  strs("Only these kinds: " + "fact, episode, procedure, preference, insight."),
 			"scope": str("Only this scope."),
 			"limit": num("Max results, default 10."),
-			"broad": boolean("Also return memories matching only one word of a multiword query."),
 		}),
 		call: handler(func(_ context.Context, e *smem.Engine, a struct {
 			Query string   `json:"query"`
 			Kind  []string `json:"kind"`
 			Scope string   `json:"scope"`
 			Limit int      `json:"limit"`
-			Broad bool     `json:"broad"`
 		}) (any, error) {
-			res, err := e.Recall(smem.RecallQuery{Text: a.Query, Kinds: a.Kind, Scope: a.Scope, Limit: a.Limit, Broad: a.Broad})
+			res, err := e.Recall(smem.RecallQuery{Text: a.Query, Kinds: a.Kind, Scope: a.Scope, Limit: a.Limit})
 			if err != nil {
 				return nil, err
 			}
