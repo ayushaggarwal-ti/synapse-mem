@@ -112,6 +112,33 @@ p2.on_session_end(msgs)
 r = json.loads(p2.handle_tool_call("memory_recall", {"query": "capital of Peru", "kind": "episode"}))
 check("session-end episode with capture on (>=3 msgs)", len(r["results"]) == 1 and "Lima" in r["results"][0]["content"],
       json.dumps(r["results"])[:200])
+
+def episodes(word):
+    r = json.loads(p2.handle_tool_call("memory_recall", {"query": "largest moon", "kind": "episode", "limit": 20}))
+    return [x for x in r["results"] if word in x["content"]]
+
+
+idem = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "largest moon of Saturn"}, {"role": "assistant", "content": "Titan."}]
+p3 = load_memory_provider("synapse-mem", register_skills=False)
+p3.initialize("s-idem", hermes_home=HOME, platform="cli", agent_context="primary")
+p3.on_session_end(idem)
+p3.on_session_end(idem)
+p3b = load_memory_provider("synapse-mem", register_skills=False)
+p3b.initialize("s-idem", hermes_home=HOME, platform="cli", agent_context="primary")
+p3b.on_session_end(idem)
+check("session-end idempotent across duplicate callbacks and re-instantiation", len(episodes("Saturn")) == 1,
+      str(len(episodes("Saturn"))))
+grown = idem + [{"role": "user", "content": "largest moon of Jupiter"}, {"role": "assistant", "content": "Ganymede."}]
+p3b.on_session_end(grown)
+p3b.on_session_end(grown)
+check("appended completed turn yields a new episode", len(episodes("Jupiter")) == 1
+      and len(episodes("Saturn")) == 1)
+p4 = load_memory_provider("synapse-mem", register_skills=False)
+p4.initialize("s-other", hermes_home=HOME, platform="cli", agent_context="primary")
+p4.on_session_end(idem)
+check("same messages in a different session are captured", len(episodes("Saturn")) == 2)
+
 sub = load_memory_provider("synapse-mem", register_skills=False)
 sub.initialize("s3", hermes_home=HOME, platform="cli", agent_context="subagent")
 sub.on_session_end([{"role": "user", "content": "subagent zebra"}, {"role": "assistant", "content": "x"},

@@ -11,6 +11,7 @@ never raised into a turn.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -600,17 +601,37 @@ class SynapseMemProvider(MemoryProvider):
             if len(convo) < _EPISODE_MIN_MESSAGES:
                 return
             user = next((_text(m.get("content")) for m in reversed(convo) if m.get("role") == "user"), "").strip()
-            reply = next((_text(m.get("content")) for m in reversed(convo)
-                          if m.get("role") == "assistant" and _text(m.get("content")).strip()), "").strip()
+            reply_idx = next((i for i in range(len(convo) - 1, -1, -1)
+                              if convo[i].get("role") == "assistant" and _text(convo[i].get("content")).strip()), -1)
+            reply = _text(convo[reply_idx].get("content")).strip() if reply_idx >= 0 else ""
             if not user or not reply:
+                return
+            marker = self._claim_boundary(f"{self._session_id}:{reply_idx}")
+            if marker is None:
                 return
             content = (f"Session episode ({self._platform}). User asked: {user[:_EPISODE_PART_CHARS]}\n"
                        f"Assistant concluded: {reply[:_EPISODE_PART_CHARS]}")
             # Synchronous: session end is followed by process exit, which would kill a daemon writer.
-            mem_id = self._remember(content, kind="episode", scope=f"hermes-{self._platform}", volatility="volatile")
+            try:
+                mem_id = self._remember(content, kind="episode", scope=f"hermes-{self._platform}",
+                                        volatility="volatile")
+            except Exception:
+                marker.unlink(missing_ok=True)
+                raise
             logger.info("synapse-mem: stored session episode %s", mem_id)
         except Exception as e:
             logger.warning("synapse-mem on_session_end failed: %s", e)
+
+    def _claim_boundary(self, boundary: str) -> Optional[Path]:
+        """Atomically claim a capture boundary under the store directory; None if already claimed."""
+        directory = self._db.parent / "episode-boundaries"
+        directory.mkdir(parents=True, exist_ok=True)
+        marker = directory / hashlib.sha256(boundary.encode()).hexdigest()
+        try:
+            os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            return None
+        return marker
 
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[Dict[str, Any]] = None) -> None:
