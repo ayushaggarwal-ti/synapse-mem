@@ -139,6 +139,54 @@ p4.initialize("s-other", hermes_home=HOME, platform="cli", agent_context="primar
 p4.on_session_end(idem)
 check("same messages in a different session are captured", len(episodes("Saturn")) == 2)
 
+
+def _episodes(query):
+    return json.loads(p2.handle_tool_call("memory_recall", {"query": query, "kind": "episode", "limit": 10}))["results"]
+
+
+def _end(sid, msgs):
+    p = load_memory_provider("synapse-mem", register_skills=False)
+    p.initialize(sid, hermes_home=HOME, platform="cli", agent_context="primary")
+    p.on_session_end(msgs)
+
+
+call = {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}
+_end("s-pair1", [{"role": "user", "content": "alpha question about pelicans"},
+                   {"role": "assistant", "content": "alpha answer pelicans fly"},
+                   {"role": "user", "content": "beta interrupted prompt about walruses"}])
+eps = _episodes("pelicans")
+check("pairing: interrupted prompt keeps last completed exchange",
+      len(eps) == 1 and "alpha question about pelicans" in eps[0]["content"]
+      and "alpha answer pelicans fly" in eps[0]["content"], json.dumps(eps)[:200])
+check("pairing: interrupted prompt is not stored", not _episodes("walruses"))
+
+_end("s-pair2", [{"role": "user", "content": "gamma question about lemurs"},
+                   {"role": "assistant", "content": "gamma answer lemurs climb"},
+                   {"role": "user", "content": "delta pending prompt about otters"},
+                   {"role": "assistant", "content": "", "tool_calls": [call]},
+                   {"role": "tool", "tool_call_id": "c1", "content": "tool output"}])
+eps = _episodes("otters")
+check("pairing: pending tool result not paired with older reply",
+      not any("otters" in e["content"] and "lemurs climb" in e["content"] for e in eps), json.dumps(eps)[:200])
+eps = _episodes("lemurs")
+check("pairing: pending tool result keeps last completed exchange",
+      len(eps) == 1 and "gamma question about lemurs" in eps[0]["content"], json.dumps(eps)[:200])
+
+_end("s-pair3", [{"role": "user", "content": "epsilon tool-only turn about badgers"},
+                   {"role": "assistant", "content": "", "tool_calls": [call]},
+                   {"role": "tool", "tool_call_id": "c1", "content": "tool output"},
+                   {"role": "assistant", "content": "", "tool_calls": [call]}])
+check("pairing: tool-only turns store nothing", not _episodes("badgers"))
+
+_end("s-pair4", [{"role": "user", "content": "zeta question about herons"},
+                   {"role": "assistant", "content": "", "tool_calls": [call]},
+                   {"role": "tool", "tool_call_id": "c1", "content": "tool output"},
+                   {"role": "assistant", "content": "zeta answer herons wade"}])
+eps = _episodes("herons")
+check("pairing: completed reply after tool use is stored",
+      len(eps) == 1 and "zeta question about herons" in eps[0]["content"]
+      and "zeta answer herons wade" in eps[0]["content"], json.dumps(eps)[:200])
+
 sub = load_memory_provider("synapse-mem", register_skills=False)
 sub.initialize("s3", hermes_home=HOME, platform="cli", agent_context="subagent")
 sub.on_session_end([{"role": "user", "content": "subagent zebra"}, {"role": "assistant", "content": "x"},

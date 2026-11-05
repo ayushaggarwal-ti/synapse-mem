@@ -106,6 +106,19 @@ def _text(content: Any) -> str:
     return ""
 
 
+def _last_exchange(convo: List[Dict[str, Any]]) -> tuple:
+    """(prompt, reply, reply index) of the last prompt answered by a final text reply with no pending tool calls."""
+    pending, found = "", ("", "", -1)
+    for i, m in enumerate(convo):
+        role = m.get("role")
+        text = _text(m.get("content")).strip()
+        if role == "user":
+            pending = text
+        elif role == "assistant" and text and not m.get("tool_calls") and pending:
+            found, pending = (pending, text, i), ""
+    return found
+
+
 def _schema(name: str, description: str, properties: dict, required: list) -> dict:
     return {"name": name, "description": description,
             "parameters": {"type": "object", "properties": properties, "required": required}}
@@ -600,10 +613,7 @@ class SynapseMemProvider(MemoryProvider):
             convo = [m for m in messages or [] if m.get("role") in ("user", "assistant", "tool")]
             if len(convo) < _EPISODE_MIN_MESSAGES:
                 return
-            user = next((_text(m.get("content")) for m in reversed(convo) if m.get("role") == "user"), "").strip()
-            reply_idx = next((i for i in range(len(convo) - 1, -1, -1)
-                              if convo[i].get("role") == "assistant" and _text(convo[i].get("content")).strip()), -1)
-            reply = _text(convo[reply_idx].get("content")).strip() if reply_idx >= 0 else ""
+            user, reply, reply_idx = _last_exchange(convo)
             if not user or not reply:
                 return
             marker = self._claim_boundary(f"{self._session_id}:{reply_idx}")
