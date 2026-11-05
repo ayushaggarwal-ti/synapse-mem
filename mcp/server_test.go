@@ -195,6 +195,29 @@ func TestRememberRecallDecideWhy(t *testing.T) {
 	}
 }
 
+func TestRecallIgnoresUnknownBroadArgument(t *testing.T) {
+	e := open(t)
+	s := &Server{Engine: e, Version: "test"}
+	session(t, s, call(1, "memory_remember", map[string]any{"content": "the api listens on port 8080", "kind": "fact"}))
+	rs := session(t, s,
+		call(2, "memory_recall", map[string]any{"query": "api port"}),
+		call(3, "memory_recall", map[string]any{"query": "api port", "broad": true}),
+	)
+	plain, isErr := text(t, rs[0])
+	if isErr {
+		t.Fatal(plain)
+	}
+	broad, isErr := text(t, rs[1])
+	if isErr {
+		t.Fatal(broad)
+	}
+	var a, b []hit
+	if json.Unmarshal([]byte(plain), &a) != nil || json.Unmarshal([]byte(broad), &b) != nil || len(a) != 1 || len(b) != 1 ||
+		a[0].ID != b[0].ID || a[0].Content != b[0].Content {
+		t.Fatalf("recall with a leftover broad argument differs:\n%s\nvs\n%s", broad, plain)
+	}
+}
+
 func TestSessionFollowsHook(t *testing.T) {
 	e := open(t)
 	if err := e.SetCurrentSession("cc-123"); err != nil {

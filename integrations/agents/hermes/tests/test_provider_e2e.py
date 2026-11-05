@@ -3,6 +3,7 @@
 Run with the Hermes venv python. HERMES_AGENT_DIR points at the hermes-agent checkout (default ~/.hermes/hermes-agent).
 """
 
+import hashlib
 import json
 import os
 import re
@@ -553,6 +554,97 @@ for name, a in [("memory_signal", {"memory_id": base, "signal": "used"}), ("memo
         check(f"broken store -> {name} error JSON", False, repr(e))
 t.shutdown()
 p.save_config({"store_path": ""}, HOME)
+
+# Relevance floor: a dedicated store loaded from the repo fixture, one memory per line.
+from importlib import import_module  # noqa: E402
+
+_mod = import_module(type(p).__module__)
+STORE_LINES = [ln.strip() for ln in
+               (Path(__file__).resolve().parents[4] / "smem" / "testdata" / "recall_store.txt").read_text().splitlines()
+               if ln.strip()]
+p.save_config({"store_path": str(Path(tempfile.mkdtemp(prefix="smem-floor-")) / "smem.db"),
+               "session_context": False, "max_prefetch": 10}, HOME)
+floor_p = load_memory_provider("synapse-mem", register_skills=False)
+floor_p.initialize("s-floor", hermes_home=HOME, platform="cli", agent_context="primary")
+for ln in STORE_LINES:
+    floor_p._remember(ln)
+check("relevance fixture loaded", len(STORE_LINES) == 198 and floor_p._run(["stats"]) != "")
+
+
+def floor_provider(sid, **cfg):
+    p.save_config({"min_relevance": None, "max_prefetch": 10, "session_context": False, **cfg}, HOME)
+    pv = load_memory_provider("synapse-mem", register_skills=False)
+    pv.initialize(sid, hermes_home=HOME, platform="cli", agent_context="primary")
+    return pv
+
+
+def injected(query, **cfg):
+    return floor_provider("s-f-" + hashlib.md5((query + json.dumps(cfg)).encode()).hexdigest()[:8], **cfg).prefetch(query)
+
+
+KUBECONFIG, CI_ROTATION = "kubeconfig for staging lives in the ops vault", "Rotate the CI deploy credentials"
+ESPRESSO, STAGING_OUT = "Office espresso machine outages", "Staging outages do not page anyone"
+check("22 default floor is 0.345", floor_provider("s-f-d")._min_relevance == 0.345)
+out = injected("rotate kubeconfig credentials")
+check("22 rotate kubeconfig credentials injects the CI rotation and kubeconfig memories",
+      CI_ROTATION in out and KUBECONFIG in out, out[:300])
+out = injected("staging database outages")
+check("22 staging database outages injects a staging outage line and no espresso line",
+      STAGING_OUT in out and ESPRESSO not in out, out[:400])
+check("22 postgres lag alert injects the postgres memory", "Postgres replica lag pages the on-call" in injected("postgres lag alert"))
+check("22 what is the cafeteria situation injects the cafeteria memory",
+      "The cafeteria menu changes weekly" in injected("what is the cafeteria situation"))
+for q, needle in [("where do we keep the kubeconfig", KUBECONFIG),
+                  ("i want to know what the cafeteria menu looks like this week", "The cafeteria menu changes weekly"),
+                  ("is the postgres replica lag alert paging anyone right now", "Postgres replica lag pages the on-call"),
+                  ("who should i contact about the office espresso machine being broken", ESPRESSO)]:
+    check(f"23 natural prompt injects its memory: {q}", needle in injected(q))
+check("24 kubernetes rollout espresso injects nothing", injected("kubernetes rollout espresso") == "")
+check("24 chatty kubeconfig prompt misses the kubeconfig memory (pinned trade-off)",
+      KUBECONFIG not in injected("hey can you remind me where the kubeconfig for staging is kept"))
+out = injected("i need to rotate the kubeconfig credentials before the staging deploy")
+check("24 long rotation prompt keeps the CI rotation memory and drops the kubeconfig memory (pinned trade-off)",
+      CI_ROTATION in out and KUBECONFIG not in out, out[:300])
+check("24 staging outage page prompt drops the staging outage memory (pinned trade-off)",
+      STAGING_OUT not in injected("can you check whether staging database outages page the on-call team"))
+check("24 dog prompt injects the office Friday memory (pinned trade-off)",
+      "The office closes early on the last Friday" in injected("can i bring my dog to the office on fridays"))
+
+zero = floor_provider("s-f-zero", min_relevance=0)
+fetches = []
+_orig_recall = zero._recall
+zero._recall = lambda q, limit, kind="", record=True: (fetches.append(limit), _orig_recall(q, limit, kind, record))[1]
+out = zero.prefetch("kubernetes rollout espresso")
+check("25 min_relevance 0 injects the espresso memory with fetch size max_prefetch",
+      ESPRESSO in out and fetches == [10], f"{fetches} {out[:200]}")
+check("26 min_relevance 0.3 injects the kubeconfig memory for the chatty prompt",
+      KUBECONFIG in injected("hey can you remind me where the kubeconfig for staging is kept", min_relevance=0.3))
+q = floor_provider("s-f-queue")
+q.queue_prefetch("staging database outages")
+time.sleep(1.5)
+out = q.prefetch("staging database outages")
+check("27 queued then consumed prefetch is also filtered", STAGING_OUT in out and ESPRESSO not in out, out[:300])
+
+for raw, want in [(None, 0.345), ("", 0.345), ("abc", 0.345), (True, 0.345), (float("nan"), 0.345),
+                  (float("inf"), 0.345), ("0.25", 0.25), (-1, 0.0), (5, 1.0)]:
+    check(f"28 _min_relevance({raw!r}) == {want}", _mod._min_relevance(raw) == want, str(_mod._min_relevance(raw)))
+rows = [{"id": "a", "relevance": 0.5}, {"id": "b", "relevance": 0.345}, {"id": "c", "relevance": 0.2},
+        {"id": "d"}, {"id": "e", "relevance": "x"}]
+check("29 _above_floor drops rows below the floor, keeps rows at the floor and rows without a numeric relevance",
+      [r["id"] for r in _mod._above_floor(rows, 0.345)] == ["a", "b", "d", "e"])
+check("29 _above_floor returns the input unchanged for floor 0", _mod._above_floor(rows, 0) is rows)
+
+ctx = floor_provider("s-f-ctx", session_context=True)
+out = ctx.prefetch("kubernetes rollout espresso")
+check("31 session context still renders when every per-turn row is below the floor",
+      out.startswith("## smem: recalled memories") or "## smem: recalled memories" in out, out[:200])
+
+tool = floor_provider("s-f-tool")
+r = json.loads(tool.handle_tool_call("memory_recall", {"query": "staging database outages", "limit": 50}))
+check("30 memory_recall is unfiltered and carries relevance",
+      any(ESPRESSO in x["content"] for x in r["results"]) and all(isinstance(x.get("relevance"), float) for x in r["results"]),
+      json.dumps(r["results"][:1]))
+p.save_config({"store_path": "", "min_relevance": None, "session_context": True}, HOME)
 
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; FAILED: {failed}" if failed else ""))

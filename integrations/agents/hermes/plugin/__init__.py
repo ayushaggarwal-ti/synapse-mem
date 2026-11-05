@@ -5,7 +5,7 @@ auto-synced. Like smem's Claude Code hooks, the first turn of a new or reset ses
 ``smem hook session-start`` context, and mutating tool calls go to ``smem hook post-tool-use``.
 One store per profile at ``<hermes_home>/synapse/smem.db`` (cwd-independent), passed to every child
 call via SMEM_DB. Settings in ``<hermes_home>/synapse-mem.json``: smem_bin, store_path, max_prefetch,
-session_context, capture_tool_calls, enable_turn_capture. Every smem failure is fail-open: logged,
+min_relevance, session_context, capture_tool_calls, enable_turn_capture. Every smem failure is fail-open: logged,
 never raised into a turn.
 """
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 _CONFIG_FILE = "synapse-mem.json"
 _DEFAULT_MAX_PREFETCH = 10
 _PREFETCH_CAP = 15
+_PREFETCH_FETCH = 50
+_DEFAULT_MIN_RELEVANCE = 0.345
 _PREFETCH_WAIT_SECS = 2.0
 _READ_TIMEOUT, _WRITE_TIMEOUT = 5, 10
 _HOOK_TIMEOUT = 5
@@ -343,6 +346,33 @@ class SmemError(RuntimeError):
     pass
 
 
+def _min_relevance(raw: Any) -> float:
+    """The per-turn relevance floor from config: default when unreadable, clamped to [0, 1]."""
+    if raw is None or raw == "" or isinstance(raw, bool):
+        return _DEFAULT_MIN_RELEVANCE
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MIN_RELEVANCE
+    if not math.isfinite(value):
+        return _DEFAULT_MIN_RELEVANCE
+    return max(0.0, min(value, 1.0))
+
+
+def _above_floor(rows: list, floor: float) -> list:
+    """Rows at or above the relevance floor; a row without a numeric relevance is kept."""
+    if floor <= 0:
+        return rows
+
+    def keep(row: dict) -> bool:
+        rel = row.get("relevance")
+        if isinstance(rel, bool) or not isinstance(rel, (int, float)) or not math.isfinite(rel):
+            return True
+        return rel >= floor
+
+    return [r for r in rows if keep(r)]
+
+
 class SynapseMemProvider(MemoryProvider):
     """Memory provider over the synapse-mem (smem) CLI."""
 
@@ -356,6 +386,7 @@ class SynapseMemProvider(MemoryProvider):
         self._primary = True
         self._ready = False
         self._max_prefetch = _DEFAULT_MAX_PREFETCH
+        self._min_relevance = _DEFAULT_MIN_RELEVANCE
         self._turn_capture = False
         self._session_context = True
         self._capture_tools = True
@@ -407,6 +438,9 @@ class SynapseMemProvider(MemoryProvider):
              "required": False, "default": ""},
             {"key": "max_prefetch", "description": "Max memories injected per turn; 0 disables all injection",
              "type": "integer", "default": _DEFAULT_MAX_PREFETCH, "minimum": 0, "maximum": _PREFETCH_CAP},
+            {"key": "min_relevance",
+             "description": "Minimum relevance (0 to 1) for memories injected per turn; 0 injects every match",
+             "type": "number", "default": _DEFAULT_MIN_RELEVANCE, "minimum": 0, "maximum": 1},
             {"key": "session_context", "description": "Inject smem's session-start context on the first turn",
              "type": "boolean", "default": True},
             {"key": "capture_tool_calls", "description": "Record mutating tool calls as signed smem actions",
@@ -430,6 +464,7 @@ class SynapseMemProvider(MemoryProvider):
                                   else max(0, min(int(raw), _PREFETCH_CAP)))
         except (TypeError, ValueError):
             self._max_prefetch = _DEFAULT_MAX_PREFETCH
+        self._min_relevance = _min_relevance(cfg.get("min_relevance"))
         self._turn_capture = _as_bool(cfg.get("enable_turn_capture", False))
         self._session_context = _as_bool(cfg.get("session_context", True))
         self._capture_tools = _as_bool(cfg.get("capture_tool_calls", True))
@@ -543,7 +578,9 @@ class SynapseMemProvider(MemoryProvider):
         def _run():
             results: list = []
             try:
-                results = self._recall(query, self._max_prefetch, record=False)[: self._max_prefetch]
+                floor = self._min_relevance
+                fetch = self._max_prefetch if floor <= 0 else max(_PREFETCH_FETCH, self._max_prefetch)
+                results = _above_floor(self._recall(query, fetch, record=False), floor)[: self._max_prefetch]
             except Exception as e:
                 logger.warning("synapse-mem prefetch failed: %s", e)
             with self._lock:
@@ -735,7 +772,7 @@ class SynapseMemProvider(MemoryProvider):
     def _tool_recall(self, a: dict) -> dict:
         limit = max(1, min(int(a.get("limit") or 10), 50))
         results = self._recall(a["query"], limit, a.get("kind") or "")
-        items = [{k: r.get(k) for k in ("id", "kind", "content", "scope", "score", "confidence", "uses")}
+        items = [{k: r.get(k) for k in ("id", "kind", "content", "scope", "score", "relevance", "confidence", "uses")}
                  for r in results]
         return {"results": items, "count": len(items)}
 

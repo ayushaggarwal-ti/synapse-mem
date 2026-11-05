@@ -66,7 +66,11 @@ the installed plugin, but keeps the store.
   with the first real message.
 - **Recall.** Each turn prefetches up to `max_prefetch` memories (default 10, cap 15) in the background
   with `--no-record`, so automatic injection doesn't count as use. Memories the session context already
-  showed aren't repeated.
+  showed aren't repeated. Only memories with relevance at or above `min_relevance` are injected.
+  Relevance is the idf-weighted share of the prompt's non-stopword tokens a memory matches. Explicit
+  `memory_recall` is not filtered and returns each item's `relevance`. Words a prompt adds that no memory
+  contains, such as greetings, count against every memory, so chatty prompts score lower. Lower
+  `min_relevance` for such profiles.
 - **Tool calls.** The plugin registers a `post_tool_call` hook. Each mutating tool call is piped to
   `smem hook post-tool-use`, which redacts it and writes it to the store's spool in about 10 ms. The next
   smem call records it as a signed action, linked to the session's decision when that is unambiguous.
@@ -94,6 +98,7 @@ Settings live in `<profile>/synapse-mem.json` (written by `hermes memory setup` 
 | `smem_bin` | `smem` on `PATH` (or `$SMEM_BIN`) | binary override |
 | `store_path` | `<profile>/synapse/smem.db` | store override |
 | `max_prefetch` | 10 | memories injected per turn, 0–15; 0 also turns off session-start context |
+| `min_relevance` | 0.345 | minimum relevance (0 to 1) for per-turn injection; 0 injects every match; unreadable values fall back to 0.345 |
 | `session_context` | true | inject smem's session-start context on the first turn |
 | `capture_tool_calls` | true | record mutating tool calls as signed actions |
 | `enable_turn_capture` | false | store episodes at compression and session end |
